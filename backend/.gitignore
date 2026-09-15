@@ -1,0 +1,27 @@
+.env
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+airflow-venv/
+
+# Python builds
+*.egg-info/
+dist/
+build/
+
+# Airflow
+logs/
+airflow-data/
+*.db
+
+# OS
+.DS_Store
+# Local scripts with secrets
+backfill_descriptions.py
+run_migration.py
+test_descriptions.py
+backfill.log
+backfill_err.log
