@@ -10,7 +10,9 @@ from sqlalchemy import (
     DateTime,
     Boolean,
     Float,
+    ForeignKey,
     Index,
+    UniqueConstraint,
 )
 from airflow_home.database.connection import Base
 
@@ -79,6 +81,7 @@ class User(Base):
     name = Column(String(300), nullable=True)
     source = Column(String(50), nullable=False, default="subscribe")  # 'subscribe' or 'cv_upload'
     job_interests = Column(Text, nullable=True)  # comma-separated interest tags
+    cv_text = Column(Text, nullable=True)  # extracted text from their last uploaded CV
     subscribed_at = Column(DateTime, default=datetime.datetime.utcnow)
     last_emailed_at = Column(DateTime, nullable=True)
 
@@ -88,3 +91,40 @@ class User(Base):
 
     def __repr__(self):
         return f"<User(id={self.id}, email='{self.email}', source='{self.source}')>"
+
+
+class UserJobNotification(Base):
+    """Tracks which jobs a user has already been emailed about, so the
+    automatic new-job-match pipeline never re-sends the same job twice."""
+    __tablename__ = "user_job_notifications"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    job_id = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    sent_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "job_id", name="uq_user_job_notifications_user_job"),
+    )
+
+    def __repr__(self):
+        return f"<UserJobNotification(user_id={self.user_id}, job_id={self.job_id})>"
+
+
+class CVSubmission(Base):
+    """A record of each CV analyze/generate action, for the 'ensure we
+    utilise the db' requirement and for future analytics."""
+    __tablename__ = "cv_submissions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    job_id = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    action = Column(String(20), nullable=False)  # 'analyze' or 'generate'
+    score = Column(Integer, nullable=True)
+    matched_skills = Column(Text, nullable=True)  # comma-separated
+    missing_skills = Column(Text, nullable=True)  # comma-separated
+    parse_confidence = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    def __repr__(self):
+        return f"<CVSubmission(user_id={self.user_id}, job_id={self.job_id}, action='{self.action}')>"

@@ -2,7 +2,7 @@ import { useParams, Link } from "react-router-dom";
 import { ArrowLeft, MapPin, Briefcase, Clock, ExternalLink, Share2, CalendarClock, Building2, Loader2, FileCheck } from "lucide-react";
 import Layout from "@/components/Layout";
 import JobCard from "@/components/JobCard";
-import { useJobs } from "@/lib/jobStore";
+import { useJob, useAllJobs } from "@/lib/jobStore";
 import { toast } from "sonner";
 
 function formatDate(dateStr: string): string {
@@ -12,10 +12,60 @@ function formatDate(dateStr: string): string {
   return d.toLocaleDateString("en-KE", { month: "long", day: "numeric", year: "numeric" });
 }
 
+/**
+ * Renders a job description as paragraphs plus real <ul> bullet lists for
+ * any •/-/* prefixed lines, instead of dumping everything as one raw
+ * whitespace-pre-line blob (which is what made pasted/manually-added job
+ * ads look unformatted).
+ */
+function JobDescription({ description }: { description: string }) {
+  const bulletRe = /^\s*[•\-*]\s+(.*)$/;
+  type Block = { type: "ul"; items: string[] } | { type: "p"; lines: string[] };
+  const blocks: Block[] = [];
+
+  for (const rawLine of description.split("\n")) {
+    const line = rawLine.trimEnd();
+    const bulletMatch = line.match(bulletRe);
+    const last = blocks[blocks.length - 1];
+    if (bulletMatch) {
+      const text = bulletMatch[1].trim();
+      if (last?.type === "ul") last.items.push(text);
+      else blocks.push({ type: "ul", items: [text] });
+    } else if (line.trim() === "") {
+      if (last?.type === "p") blocks.push({ type: "p", lines: [] });
+    } else if (last?.type === "p") {
+      last.lines.push(line);
+    } else {
+      blocks.push({ type: "p", lines: [line] });
+    }
+  }
+
+  return (
+    <>
+      {blocks.map((block, i) =>
+        block.type === "ul" ? (
+          <ul key={i} className="space-y-2 mb-4">
+            {block.items.map((item, j) => (
+              <li key={j} className="flex items-start gap-2 text-sm text-muted-foreground">
+                <span className="w-1.5 h-1.5 bg-primary rounded-full shrink-0 mt-1.5" />
+                {item}
+              </li>
+            ))}
+          </ul>
+        ) : block.lines.length > 0 ? (
+          <p key={i} className="text-sm text-muted-foreground leading-relaxed mb-4 whitespace-pre-line break-words">
+            {block.lines.join("\n")}
+          </p>
+        ) : null
+      )}
+    </>
+  );
+}
+
 const JobDetails = () => {
   const { id } = useParams();
-  const { jobs: allJobs, loading } = useJobs();
-  const job = allJobs.find((j) => j.id === id);
+  const { job, isLoading: loading } = useJob(id);
+  const { jobs: allJobs } = useAllJobs();
 
   if (loading) {
     return (
@@ -94,8 +144,8 @@ const JobDetails = () => {
 
                 <h2 className="font-heading font-semibold text-base sm:text-lg mb-3">Description</h2>
                 {hasDescription ? (
-                  <div className="text-sm text-muted-foreground leading-relaxed mb-6 whitespace-pre-line break-words overflow-hidden">
-                    {job.description}
+                  <div className="mb-6 break-words overflow-hidden">
+                    <JobDescription description={job.description} />
                   </div>
                 ) : (
                   <div className="text-sm text-muted-foreground mb-6 bg-muted/50 rounded-lg p-4">

@@ -1,29 +1,13 @@
-import { useState, useMemo } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
-import { Search, Building2, Loader2 } from "lucide-react";
+import { Search, Loader2 } from "lucide-react";
 import { motion } from "framer-motion";
 import Layout from "@/components/Layout";
-import { useJobs } from "@/lib/jobStore";
+import { useCompanies } from "@/lib/jobStore";
 
 const Companies = () => {
   const [search, setSearch] = useState("");
-  const { jobs, loading } = useJobs();
-
-  const companies = useMemo(() => {
-    const map: Record<string, { name: string; logo: string; jobCount: number }> = {};
-    jobs.forEach((job) => {
-      if (!job.company) return;
-      if (!map[job.company]) {
-        map[job.company] = {
-          name: job.company,
-          logo: job.company[0]?.toUpperCase() ?? "?",
-          jobCount: 0,
-        };
-      }
-      map[job.company].jobCount++;
-    });
-    return Object.values(map).sort((a, b) => b.jobCount - a.jobCount);
-  }, [jobs]);
+  const { companies, isLoading: loading } = useCompanies();
 
   const filtered = companies.filter((c) =>
     c.name.toLowerCase().includes(search.toLowerCase())
@@ -71,12 +55,12 @@ const Companies = () => {
                   className="bg-card border border-border rounded-xl p-5 hover-lift flex items-center gap-4 block"
                 >
                   <div className="w-12 h-12 rounded-xl bg-primary/10 text-primary font-heading font-bold flex items-center justify-center text-lg">
-                    {company.logo}
+                    {company.name[0]?.toUpperCase() ?? "?"}
                   </div>
                   <div className="flex-1 min-w-0">
                     <h3 className="font-heading font-semibold truncate">{company.name}</h3>
                   </div>
-                  <span className="text-xs font-medium text-primary whitespace-nowrap">{company.jobCount} jobs</span>
+                  <span className="text-xs font-medium text-primary whitespace-nowrap">{company.count} jobs</span>
                 </Link>
               </motion.div>
             ))}

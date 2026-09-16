@@ -2,9 +2,12 @@
 Jobs Pipeline - Configuration
 """
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 class Settings:
@@ -15,6 +18,7 @@ class Settings:
     DB_USER     = os.getenv("DB_USER")
     DB_PASSWORD = os.getenv("DB_PASSWORD")
     DB_SSLMODE  = os.getenv("DB_SSLMODE", "require")
+    DB_SCHEMA   = os.getenv("DB_SCHEMA", "jobs")
 
     @property
     def database_url(self) -> str:
@@ -46,6 +50,11 @@ class Settings:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     )
     SCRAPE_INTERVAL_HOURS = int(os.getenv("SCRAPE_INTERVAL_HOURS", "24"))
+
+    # ── Admin auth ───────────────────────────────────────────────────────────
+    ADMIN_USERNAME       = os.getenv("ADMIN_USERNAME", "")
+    ADMIN_PASSWORD       = os.getenv("ADMIN_PASSWORD", "")
+    ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET", "")
 
 
 settings = Settings()

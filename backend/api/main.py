@@ -2,28 +2,37 @@
 Backend API - FastAPI application for serving job data.
 Includes built-in cron scheduler that runs daily at 2PM EAT.
 """
+import hmac
 import math
+import re
 import logging
 import smtplib
 import threading
 import httpx
+import jwt
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi import FastAPI, Depends, Query, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import Response
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc, text
+from sqlalchemy import func, desc, text, nullslast
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from airflow_home.database.connection import get_db, init_db
-from airflow_home.database.models import Job, ScrapeLog, User
+from airflow_home.database.connection import get_db, init_db, SessionLocal
+from airflow_home.database.models import Job, ScrapeLog, User, UserJobNotification, CVSubmission
 from airflow_home.config.settings import settings
+from api.cv.extract import extract_text_from_upload, CvExtractionError
+from api.cv.parser import parse_cv
+from api.cv.matcher import analyze, extract_job_keywords
+from api.cv.pdf_builder import build_ats_cv_pdf
 
 app = FastAPI(
     title="Jobs Pipeline API",
@@ -95,6 +104,9 @@ class PaginatedResponse(BaseModel):
 class StatsResponse(BaseModel):
     total_jobs: int
     active_jobs: int
+    remote_jobs: int
+    job_type_counts: dict
+    companies: int
     sources: dict
     recent_scrapes: list[dict]
 
@@ -104,12 +116,35 @@ class CreateJobRequest(BaseModel):
     company: Optional[str] = None
     location: Optional[str] = None
     description: Optional[str] = None
+    requirements: Optional[str] = None
     job_type: Optional[str] = None
     experience_level: Optional[str] = None
     remote: bool = False
     apply_url: Optional[str] = None
     tags: Optional[str] = None
     application_deadline: Optional[str] = None
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+# --- Admin auth ---
+# A single shared admin account (env-configured), gated behind a
+# server-issued JWT instead of the old client-side-only credential check.
+
+ADMIN_TOKEN_TTL = timedelta(hours=12)
+_admin_auth_scheme = HTTPBearer(auto_error=False)
+
+
+def require_admin(creds: Optional[HTTPAuthorizationCredentials] = Depends(_admin_auth_scheme)):
+    if creds is None:
+        raise HTTPException(status_code=401, detail="Missing admin token")
+    try:
+        jwt.decode(creds.credentials, settings.ADMIN_SESSION_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired admin token")
 
 
 # --- Startup ---
@@ -132,6 +167,14 @@ def scheduled_daily_scrape():
         logger.info(f"=== DAILY SCRAPE DONE: {total} jobs from {len(results)} sources ===")
     except Exception as e:
         logger.error(f"Scheduled scrape failed: {e}")
+
+    # Runs regardless of scrape outcome above — any jobs that DID scrape
+    # successfully are already committed per-source, so this is safe to run
+    # unconditionally rather than being coupled to full scrape success.
+    try:
+        notify_users_of_new_jobs()
+    except Exception as e:
+        logger.error(f"notify_users_of_new_jobs failed: {e}")
 
 
 def keep_alive_ping():
@@ -168,6 +211,9 @@ def startup():
                     last_emailed_at TIMESTAMP
                 )
             """))
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS cv_text TEXT"
+            ))
             conn.execute(text("COMMIT"))
             logger.info("DB migration: columns/tables ensured")
         except Exception as e:
@@ -212,11 +258,64 @@ async def generic_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": str(exc)}, headers=headers)
 
 
+# --- Shared job-visibility filter ---
+
+AGGREGATOR_TITLE_PATTERNS = [
+    "%Hiring For jobs%", "%Hiring Full Time jobs%",
+    "%Job In Kenya Jobs%", "Jobs in Kenya%", "Jobs in Nairobi%",
+    "%Trending%Jobs%", "%Latest%Jobs in Kenya%",
+    "%Explore the Trending%", "%Check out the%Jobs%",
+    "%Exciting Trending%", "%Latest In-Demand%",
+    "%Your CV Format%", "Click here to%", "%post comments%",
+    "CURRENT%JOBS IN KENYA%", "Current%Jobs in Kenya%",
+    "All jobs |%", "%Jobs Archive%", "Jobweb Kenya:%",
+    "%Jobs, Employment%", "%Now Hiring jobs%",
+    "%Immediate jobs in%", "%We Are Hiring jobs%",
+    "%Vacancies jobs in%", "%Companies Hiring jobs%",
+    "%Hiring jobs in%", "%jobs in Kenya (%",
+]
+
+
+def _active_visible_jobs_query(db: Session):
+    """Jobs that should actually be shown to users: active, not expired,
+    with a real title/description, and not scraper/aggregator junk.
+    Shared by /api/jobs, /api/categories, /api/locations, /api/companies
+    so their counts stay consistent with each other."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    query = db.query(Job).filter(Job.is_active == True)
+    query = query.filter(
+        (Job.application_deadline == None) | (Job.application_deadline >= now)
+    )
+    query = query.filter(Job.description != None, Job.description != "", func.length(Job.description) > 30)
+    query = query.filter(func.length(Job.title) > 5)
+    for pattern in AGGREGATOR_TITLE_PATTERNS:
+        query = query.filter(~Job.title.ilike(pattern))
+    query = query.filter(~Job.source.ilike("google_%"))
+    return query
+
+
 # --- Endpoints ---
 
 @app.get("/")
 def root():
     return {"message": "Jobs Pipeline API", "docs": "/docs"}
+
+
+@app.post("/api/admin/login")
+def admin_login(req: AdminLoginRequest):
+    if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD or not settings.ADMIN_SESSION_SECRET:
+        raise HTTPException(status_code=503, detail="Admin login is not configured")
+    valid_user = hmac.compare_digest(req.username, settings.ADMIN_USERNAME)
+    valid_pass = hmac.compare_digest(req.password, settings.ADMIN_PASSWORD)
+    if not (valid_user and valid_pass):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    expires_at = datetime.now(timezone.utc) + ADMIN_TOKEN_TTL
+    token = jwt.encode(
+        {"sub": "admin", "exp": expires_at},
+        settings.ADMIN_SESSION_SECRET,
+        algorithm="HS256",
+    )
+    return {"token": token, "expires_at": expires_at.isoformat()}
 
 
 @app.get("/api/jobs", response_model=PaginatedResponse)
@@ -228,35 +327,11 @@ def list_jobs(
     location: Optional[str] = None,
     job_type: Optional[str] = None,
     remote: Optional[bool] = None,
-    sort_by: str = Query("scraped_at", pattern="^(scraped_at|posted_date|title|company)$"),
+    sort_by: str = Query("scraped_at", pattern="^(scraped_at|posted_date|title|company|salary_min)$"),
     sort_order: str = Query("desc", pattern="^(asc|desc)$"),
     db: Session = Depends(get_db),
 ):
-    query = db.query(Job).filter(Job.is_active == True)
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    query = query.filter(
-        (Job.application_deadline == None) | (Job.application_deadline >= now)
-    )
-    query = query.filter(Job.description != None, Job.description != "", func.length(Job.description) > 30)
-    query = query.filter(func.length(Job.title) > 5)
-
-    aggregator_patterns = [
-        "%Hiring For jobs%", "%Hiring Full Time jobs%",
-        "%Job In Kenya Jobs%", "Jobs in Kenya%", "Jobs in Nairobi%",
-        "%Trending%Jobs%", "%Latest%Jobs in Kenya%",
-        "%Explore the Trending%", "%Check out the%Jobs%",
-        "%Exciting Trending%", "%Latest In-Demand%",
-        "%Your CV Format%", "Click here to%", "%post comments%",
-        "CURRENT%JOBS IN KENYA%", "Current%Jobs in Kenya%",
-        "All jobs |%", "%Jobs Archive%", "Jobweb Kenya:%",
-        "%Jobs, Employment%", "%Now Hiring jobs%",
-        "%Immediate jobs in%", "%We Are Hiring jobs%",
-        "%Vacancies jobs in%", "%Companies Hiring jobs%",
-        "%Hiring jobs in%", "%jobs in Kenya (%",
-    ]
-    for pattern in aggregator_patterns:
-        query = query.filter(~Job.title.ilike(pattern))
-    query = query.filter(~Job.source.ilike("google_%"))
+    query = _active_visible_jobs_query(db)
 
     if search:
         sf = f"%{search}%"
@@ -269,12 +344,17 @@ def list_jobs(
     if location:
         query = query.filter(Job.location.ilike(f"%{location}%"))
     if job_type:
-        query = query.filter(Job.job_type == job_type)
+        query = query.filter(Job.job_type.ilike(job_type))
     if remote is not None:
         query = query.filter(Job.remote == remote)
 
     sort_col = getattr(Job, sort_by, Job.scraped_at)
-    query = query.order_by(desc(sort_col) if sort_order == "desc" else sort_col)
+    ordering = desc(sort_col) if sort_order == "desc" else sort_col
+    if sort_by == "salary_min":
+        # Postgres defaults NULLs to sort FIRST on DESC — push unknown
+        # salaries to the bottom regardless of direction instead.
+        ordering = nullslast(ordering)
+    query = query.order_by(ordering)
 
     total = query.count()
     pages = math.ceil(total / per_page) if total > 0 else 1
@@ -295,7 +375,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs")
-def create_job(req: CreateJobRequest, db: Session = Depends(get_db)):
+def create_job(req: CreateJobRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
     deadline = None
     if req.application_deadline:
         try:
@@ -304,7 +384,8 @@ def create_job(req: CreateJobRequest, db: Session = Depends(get_db)):
             pass
     job = Job(
         title=req.title, company=req.company, location=req.location,
-        description=req.description, job_type=req.job_type,
+        description=req.description, requirements=req.requirements,
+        job_type=req.job_type,
         experience_level=req.experience_level, remote=req.remote,
         url=req.apply_url, apply_url=req.apply_url, source="manual",
         tags=req.tags, application_deadline=deadline,
@@ -319,7 +400,7 @@ def create_job(req: CreateJobRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs/cleanup")
-def cleanup_junk_jobs(db: Session = Depends(get_db)):
+def cleanup_junk_jobs(db: Session = Depends(get_db), _admin=Depends(require_admin)):
     from sqlalchemy import or_
     all_junk_ids = set()
     no_desc = (
@@ -329,21 +410,7 @@ def cleanup_junk_jobs(db: Session = Depends(get_db)):
         ).all()
     )
     all_junk_ids.update(j.id for j in no_desc)
-    aggregator_patterns = [
-        "%Hiring For jobs%", "%Hiring Full Time jobs%",
-        "%Job In Kenya Jobs%", "Jobs in Kenya%", "Jobs in Nairobi%",
-        "%Trending%Jobs%", "%Latest%Jobs in Kenya%",
-        "%Explore the Trending%", "%Check out the%Jobs%",
-        "%Exciting Trending%", "%Latest In-Demand%",
-        "%Your CV Format%", "Click here to%", "%post comments%",
-        "CURRENT%JOBS IN KENYA%", "Current%Jobs in Kenya%",
-        "All jobs |%", "%Jobs Archive%", "Jobweb Kenya:%",
-        "%Jobs, Employment%", "%Now Hiring jobs%",
-        "%Immediate jobs in%", "%We Are Hiring jobs%",
-        "%Vacancies jobs in%", "%Companies Hiring jobs%",
-        "%Hiring jobs in%", "%jobs in Kenya (%",
-    ]
-    for pattern in aggregator_patterns:
+    for pattern in AGGREGATOR_TITLE_PATTERNS:
         matches = db.query(Job.id).filter(Job.is_active == True, Job.title.ilike(pattern)).all()
         all_junk_ids.update(j.id for j in matches)
     short = db.query(Job.id).filter(Job.is_active == True, func.length(Job.title) <= 5).all()
@@ -373,14 +440,97 @@ def list_sources(db: Session = Depends(get_db)):
     return {"sources": {source: count for source, count in results}}
 
 
+@app.get("/api/categories")
+def list_categories(limit: Optional[int] = Query(None, ge=1, le=100), db: Session = Depends(get_db)):
+    """Category facet counts, derived from Job.tags (comma-separated).
+    Aggregated server-side so the homepage/Categories page don't need to
+    download every job row just to compute this."""
+    rows = _active_visible_jobs_query(db).with_entities(Job.tags).all()
+    counts: dict = {}
+    labels: dict = {}
+    for (tags,) in rows:
+        if not tags:
+            continue
+        for raw in tags.split(","):
+            name = raw.strip()
+            if not name:
+                continue
+            key = name.lower()
+            counts[key] = counts.get(key, 0) + 1
+            labels.setdefault(key, name)
+    categories = [
+        {"name": labels[key], "count": count}
+        for key, count in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+    if limit:
+        categories = categories[:limit]
+    return {"categories": categories}
+
+
+@app.get("/api/locations")
+def list_locations(limit: Optional[int] = Query(None, ge=1, le=200), db: Session = Depends(get_db)):
+    rows = (
+        _active_visible_jobs_query(db)
+        .with_entities(Job.location, func.count(Job.id))
+        .group_by(Job.location)
+        .order_by(desc(func.count(Job.id)))
+        .all()
+    )
+    locations = [{"name": loc, "count": count} for loc, count in rows if loc]
+    if limit:
+        locations = locations[:limit]
+    return {"locations": locations}
+
+
+@app.get("/api/companies")
+def list_companies(limit: Optional[int] = Query(None, ge=1, le=200), db: Session = Depends(get_db)):
+    rows = (
+        _active_visible_jobs_query(db)
+        .with_entities(Job.company, func.count(Job.id))
+        .group_by(Job.company)
+        .order_by(desc(func.count(Job.id)))
+        .all()
+    )
+    companies = [{"name": c, "count": count} for c, count in rows if c]
+    if limit:
+        companies = companies[:limit]
+    return {"companies": companies}
+
+
 @app.get("/api/stats", response_model=StatsResponse)
 def get_stats(db: Session = Depends(get_db)):
     total_jobs = db.query(func.count(Job.id)).scalar()
     active_jobs = db.query(func.count(Job.id)).filter(Job.is_active == True).scalar()
     source_counts = db.query(Job.source, func.count(Job.id)).group_by(Job.source).all()
     recent_logs = db.query(ScrapeLog).order_by(desc(ScrapeLog.started_at)).limit(20).all()
+
+    visible = _active_visible_jobs_query(db)
+    remote_jobs = visible.filter(Job.remote == True).count()
+    job_type_rows = (
+        visible.with_entities(Job.job_type, func.count(Job.id))
+        .group_by(Job.job_type).all()
+    )
+    # Merge case-variant job_type values (e.g. "Full-time" / "full-time")
+    # into one bucket, keeping the first-seen casing for display.
+    job_type_counts: dict = {}
+    job_type_labels: dict = {}
+    for jt, c in job_type_rows:
+        if not jt:
+            continue
+        key = jt.lower()
+        job_type_counts[key] = job_type_counts.get(key, 0) + c
+        job_type_labels.setdefault(key, jt)
+    job_type_counts = {job_type_labels[k]: v for k, v in job_type_counts.items()}
+    companies = (
+        _active_visible_jobs_query(db).with_entities(Job.company)
+        .filter(Job.company != None, Job.company != "")
+        .distinct().count()
+    )
+
     return StatsResponse(
         total_jobs=total_jobs, active_jobs=active_jobs,
+        remote_jobs=remote_jobs, job_type_counts=job_type_counts,
+        companies=companies,
         sources={s: c for s, c in source_counts},
         recent_scrapes=[
             {
@@ -399,6 +549,7 @@ def trigger_scrape(
     search_query: Optional[str] = None,
     location: Optional[str] = None,
     max_pages: int = Query(3, ge=1, le=10),
+    _admin=Depends(require_admin),
 ):
     from airflow_home.scrapers.runner import run_scraper, SCRAPER_REGISTRY
     if source not in SCRAPER_REGISTRY:
@@ -693,6 +844,192 @@ def _save_user(db: Session, email: str, name: str = None, source: str = "subscri
     return user
 
 
+def _match_jobs_for_interests(db: Session, job_interests: str, limit: int = 5, exclude_ids: Optional[set] = None):
+    """Keyword-match active jobs against a free-text interests/skills string.
+    Shared by register_user, send_bulk_alerts, and notify_users_of_new_jobs
+    so the matching behavior stays identical everywhere it's used."""
+    from sqlalchemy import or_
+    keywords = [kw.strip().lower() for kw in job_interests.replace(",", " ").split() if len(kw.strip()) > 2]
+    if not keywords:
+        keywords = [job_interests.strip().lower()]
+    filters = [Job.title.ilike(f"%{kw}%") for kw in keywords] + [Job.description.ilike(f"%{kw}%") for kw in keywords]
+    query = db.query(Job).filter(Job.is_active == True).filter(or_(*filters))
+    if exclude_ids:
+        query = query.filter(~Job.id.in_(exclude_ids))
+    return query.order_by(desc(Job.scraped_at)).limit(limit).all()
+
+
+def notify_users_of_new_jobs():
+    """Match every stored user against currently-active jobs and email them
+    only the jobs they haven't already been notified about (tracked via
+    UserJobNotification). Intended to run once per scrape cycle — safe to
+    call repeatedly since it's a no-op for users with nothing new to see.
+    Runs outside a request context (from the scheduler), so it opens and
+    closes its own DB session rather than using the get_db() dependency."""
+    if not (settings.BREVO_API_KEY or settings.RESEND_API_KEY or settings.SMTP_PASSWORD):
+        logger.info("notify_users_of_new_jobs: no email provider configured, skipping")
+        return
+
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    db = SessionLocal()
+    try:
+        users = db.query(User).all()
+        featured = (
+            db.query(Job).filter(Job.is_active == True)
+            .order_by(desc(Job.scraped_at)).limit(5).all()
+        )
+        notified_count = 0
+        for user in users:
+            already_notified = {
+                row.job_id for row in
+                db.query(UserJobNotification.job_id).filter(UserJobNotification.user_id == user.id).all()
+            }
+            if user.job_interests:
+                candidates = _match_jobs_for_interests(db, user.job_interests, limit=5, exclude_ids=already_notified)
+            else:
+                candidates = [j for j in featured if j.id not in already_notified]
+
+            if not candidates:
+                continue
+
+            if user.job_interests:
+                interest_label = user.job_interests.title()
+                html = build_targeted_email_html(user.name or "there", interest_label, candidates)
+                subject = f"New jobs for {interest_label} professionals — Annex Careers"
+            else:
+                html = build_welcome_email_html(candidates, name=user.name)
+                subject = "New jobs matching your profile — Annex Careers"
+
+            send_email_background(user.email, subject, html)
+            user.last_emailed_at = datetime.now(timezone.utc)
+
+            for job in candidates:
+                stmt = pg_insert(UserJobNotification.__table__).values(
+                    user_id=user.id, job_id=job.id, sent_at=datetime.now(timezone.utc)
+                ).on_conflict_do_nothing(index_elements=["user_id", "job_id"])
+                db.execute(stmt)
+            notified_count += 1
+
+        db.commit()
+        logger.info(f"notify_users_of_new_jobs: emailed {notified_count} of {len(users)} users")
+    except Exception as e:
+        logger.error(f"notify_users_of_new_jobs failed: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+# --- CV Engine (rule-based, no external AI API) ---
+#
+# Replaces the old client-side flow that called Gemini directly from the
+# browser with a public API key and burned through free-tier quota. This
+# is fully deterministic: text extraction (api/cv/extract.py) -> structured
+# parsing (api/cv/parser.py) -> keyword scoring (api/cv/matcher.py) ->
+# optional PDF generation (api/cv/pdf_builder.py). No AI API calls, no
+# quota risk, runs entirely on this server.
+
+def _job_context_text(job: Job) -> str:
+    return " ".join(filter(None, [job.description, job.requirements, job.tags]))
+
+
+def _prepare_cv_analysis(content: bytes, filename: str, job_id: Optional[int], db: Session):
+    """Shared pipeline for /api/cv/analyze and /api/cv/generate: extract,
+    parse, score, and persist. Raises HTTPException on bad input."""
+    try:
+        raw_text = extract_text_from_upload(filename, content)
+    except CvExtractionError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    parsed = parse_cv(raw_text)
+
+    job = None
+    job_keywords = None
+    if job_id is not None:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job_keywords = extract_job_keywords(_job_context_text(job))
+
+    result = analyze(
+        parsed, job_keywords,
+        job_title=job.title if job else "", company=job.company if job else "",
+    )
+
+    user_id = None
+    if parsed.email:
+        user = _save_user(
+            db, email=parsed.email, name=parsed.name, source="cv_upload",
+            # Real extracted skills (not just one job title) — this also
+            # directly improves notify_users_of_new_jobs()'s match quality.
+            job_interests=", ".join(parsed.skills) if parsed.skills else None,
+        )
+        user.cv_text = raw_text
+        db.commit()
+        user_id = user.id
+
+    return parsed, job, result, user_id
+
+
+def _record_cv_submission(db: Session, user_id: Optional[int], job_id: Optional[int], action: str, result, parsed):
+    db.add(CVSubmission(
+        user_id=user_id, job_id=job_id, action=action,
+        score=result.score,
+        matched_skills=",".join(result.matched_skills) or None,
+        missing_skills=",".join(result.missing_skills) or None,
+        parse_confidence=parsed.parse_confidence,
+    ))
+    db.commit()
+
+
+@app.post("/api/cv/analyze")
+async def analyze_cv(
+    file: UploadFile = File(...),
+    job_id: Optional[int] = Form(None),
+    db: Session = Depends(get_db),
+):
+    content = await file.read()
+    parsed, job, result, user_id = _prepare_cv_analysis(content, file.filename or "", job_id, db)
+    _record_cv_submission(db, user_id, job_id, "analyze", result, parsed)
+
+    return {
+        "type": "analysis",
+        "score": result.score,
+        "summary": result.summary,
+        "strengths": result.strengths,
+        "gaps": result.gaps,
+        "recommendations": result.recommendations,
+        "matched_skills": result.matched_skills,
+        "missing_skills": result.missing_skills,
+        "candidate_name": result.candidate_name,
+        "candidate_email": result.candidate_email,
+        "parse_confidence": result.parse_confidence,
+        "low_confidence": result.low_confidence,
+    }
+
+
+@app.post("/api/cv/generate")
+async def generate_cv(
+    file: UploadFile = File(...),
+    job_id: Optional[int] = Form(None),
+    db: Session = Depends(get_db),
+):
+    content = await file.read()
+    parsed, job, result, user_id = _prepare_cv_analysis(content, file.filename or "", job_id, db)
+    _record_cv_submission(db, user_id, job_id, "generate", result, parsed)
+
+    pdf_bytes = build_ats_cv_pdf(
+        parsed, matched_skills=result.matched_skills,
+        job_title=job.title if job else "", company=job.company if job else "",
+    )
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", parsed.name or "ATS_CV").strip("_") or "ATS_CV"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'},
+    )
+
+
 # --- Subscription / User endpoints ---
 
 class SubscribeRequest(BaseModel):
@@ -732,18 +1069,7 @@ def register_user(req: UserRegisterRequest, db: Session = Depends(get_db)):
     user = _save_user(db, email=req.email, name=req.name, source="cv_upload", job_interests=req.job_interests)
 
     if req.job_interests and (settings.BREVO_API_KEY or settings.RESEND_API_KEY or settings.SMTP_PASSWORD):
-        from sqlalchemy import or_
-        keywords = [kw.strip().lower() for kw in req.job_interests.replace(",", " ").split() if len(kw.strip()) > 2]
-        if not keywords:
-            keywords = [req.job_interests.strip().lower()]
-        filters = []
-        for kw in keywords:
-            filters.append(Job.title.ilike(f"%{kw}%"))
-            filters.append(Job.description.ilike(f"%{kw}%"))
-        matched = (
-            db.query(Job).filter(Job.is_active == True)
-            .filter(or_(*filters)).order_by(desc(Job.scraped_at)).limit(5).all()
-        )
+        matched = _match_jobs_for_interests(db, req.job_interests)
         if not matched:
             matched = db.query(Job).filter(Job.is_active == True).order_by(desc(Job.scraped_at)).limit(5).all()
 
@@ -761,11 +1087,19 @@ def register_user(req: UserRegisterRequest, db: Session = Depends(get_db)):
 
 
 @app.get("/api/users")
-def list_users(source: Optional[str] = None, db: Session = Depends(get_db)):
+def list_users(
+    source: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _admin=Depends(require_admin),
+):
     query = db.query(User).order_by(desc(User.subscribed_at))
     if source:
         query = query.filter(User.source == source)
-    users = query.all()
+    total = query.count()
+    pages = math.ceil(total / per_page) if total > 0 else 1
+    users = query.offset((page - 1) * per_page).limit(per_page).all()
     return {
         "users": [
             {
@@ -776,12 +1110,12 @@ def list_users(source: Optional[str] = None, db: Session = Depends(get_db)):
             }
             for u in users
         ],
-        "total": len(users),
+        "total": total, "page": page, "pages": pages, "per_page": per_page,
     }
 
 
 @app.post("/api/users/send-alerts")
-def send_bulk_alerts(req: BulkEmailRequest, db: Session = Depends(get_db)):
+def send_bulk_alerts(req: BulkEmailRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
     if not settings.BREVO_API_KEY and not settings.RESEND_API_KEY and not settings.SMTP_PASSWORD:
         raise HTTPException(status_code=503, detail="Email service not configured")
 
@@ -796,15 +1130,7 @@ def send_bulk_alerts(req: BulkEmailRequest, db: Session = Depends(get_db)):
     sent = 0
     for user in users:
         if user.job_interests:
-            from sqlalchemy import or_
-            keywords = [kw.strip().lower() for kw in user.job_interests.replace(",", " ").split() if len(kw.strip()) > 2]
-            if not keywords:
-                keywords = [user.job_interests.strip().lower()]
-            filters = [Job.title.ilike(f"%{kw}%") for kw in keywords] + [Job.description.ilike(f"%{kw}%") for kw in keywords]
-            matched = (
-                db.query(Job).filter(Job.is_active == True)
-                .filter(or_(*filters)).order_by(desc(Job.scraped_at)).limit(5).all()
-            )
+            matched = _match_jobs_for_interests(db, user.job_interests)
             jobs_to_send   = matched if matched else featured
             interest_label = user.job_interests.title()
             html    = build_targeted_email_html(user.name or "there", interest_label, jobs_to_send)
@@ -822,7 +1148,7 @@ def send_bulk_alerts(req: BulkEmailRequest, db: Session = Depends(get_db)):
 
 
 @app.get("/api/scrape-logs")
-def get_scrape_logs(limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db)):
+def get_scrape_logs(limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db), _admin=Depends(require_admin)):
     logs = db.query(ScrapeLog).order_by(desc(ScrapeLog.started_at)).limit(limit).all()
     return {
         "logs": [
@@ -840,7 +1166,7 @@ def get_scrape_logs(limit: int = Query(50, ge=1, le=200), db: Session = Depends(
 
 
 @app.get("/api/scheduler")
-def scheduler_status():
+def scheduler_status(_admin=Depends(require_admin)):
     jobs = scheduler.get_jobs()
     return {
         "running": scheduler.running,
@@ -856,6 +1182,7 @@ def trigger_full_scrape(
     search_query: Optional[str] = None,
     location: Optional[str] = Query("Kenya"),
     max_pages: int = Query(3, ge=1, le=10),
+    _admin=Depends(require_admin),
 ):
     from airflow_home.scrapers.runner import run_all_scrapers
     results = run_all_scrapers(search_query=search_query, location=location, max_pages=max_pages)

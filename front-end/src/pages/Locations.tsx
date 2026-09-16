@@ -2,36 +2,13 @@ import { Link } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { motion } from "framer-motion";
 import Layout from "@/components/Layout";
-import { useJobs } from "@/lib/jobStore";
-import { useMemo } from "react";
-
-/** Returns true if this looks like a real geographic location */
-function isValidLocation(loc: string): boolean {
-  if (!loc || loc.length < 2) return false;
-  if (/KSh|USD|\$|KES/i.test(loc)) return false;
-  if (/\d{2,},\d{3}/.test(loc)) return false;
-  if (/^confidential$/i.test(loc.trim())) return false;
-  if (/full.?time|part.?time|contract|internship|education/i.test(loc)) return false;
-  if (/^\d+[\s\-,\d]*$/.test(loc)) return false;
-  if (!/[a-zA-Z]/.test(loc)) return false;
-  return true;
-}
+import { useLocations } from "@/lib/jobStore";
+import { isValidLocation } from "@/lib/locationUtils";
 
 const Locations = () => {
-  const { jobs, loading } = useJobs();
+  const { locations: rawLocations, isLoading: loading } = useLocations();
+  const locations = rawLocations.filter((l) => isValidLocation(l.name));
 
-  const locations = useMemo(() => {
-    const map: Record<string, { name: string; jobCount: number }> = {};
-    jobs.forEach((job) => {
-      if (!job.location || !isValidLocation(job.location)) return;
-      const loc = job.location.trim();
-      if (!map[loc]) {
-        map[loc] = { name: loc, jobCount: 0 };
-      }
-      map[loc].jobCount++;
-    });
-    return Object.values(map).sort((a, b) => b.jobCount - a.jobCount);
-  }, [jobs]);
   return (
     <Layout>
       <div className="pt-28 md:pt-36 lg:pt-20">
@@ -62,7 +39,7 @@ const Locations = () => {
                   className="bg-card border border-border rounded-xl p-6 hover-lift flex flex-col items-center text-center block"
                 >
                   <h3 className="font-heading font-semibold text-lg">{loc.name}</h3>
-                  <p className="text-sm text-muted-foreground mt-1">{loc.jobCount} active jobs</p>
+                  <p className="text-sm text-muted-foreground mt-1">{loc.count} active jobs</p>
                 </Link>
               </motion.div>
             ))}

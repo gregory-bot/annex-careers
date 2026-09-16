@@ -2,9 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Mail, Loader2 } from "lucide-react";
 import { toast } from "sonner";
-
-// ✅ Fixed: Always use the hosted backend URL
-const API_BASE = "https://jobs-data-pipeline.onrender.com";
+import { API_BASE } from "@/lib/jobStore";
 
 const Footer = () => {
   const [email, setEmail] = useState("");

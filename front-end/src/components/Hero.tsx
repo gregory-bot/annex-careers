@@ -4,7 +4,10 @@ import { motion } from "framer-motion";
 
 // Optimised image URLs — compressed, resized for web
 const heroImages = [
-  "https://images.pexels.com/photos/23496636/pexels-photo-23496636.jpeg",
+  // ↓ was missing compress/resize params — meant this was the ONE image
+  // loaded eagerly (blocking the whole hero) that shipped at full
+  // original resolution instead of the optimized ~1280px/q60 variant.
+  "https://images.pexels.com/photos/23496636/pexels-photo-23496636.jpeg?auto=compress&cs=tinysrgb&w=1280&q=60",
   "https://images.pexels.com/photos/7520156/pexels-photo-7520156.jpeg?auto=compress&cs=tinysrgb&w=1280&q=60",
   "https://images.pexels.com/photos/6632497/pexels-photo-6632497.jpeg?auto=compress&cs=tinysrgb&w=1280&q=60",
 ];
@@ -70,8 +73,13 @@ const Hero = () => {
   return (
     <section className="relative h-[65vh] sm:h-[72vh] md:h-[80vh] lg:h-[88vh] min-h-[380px] sm:min-h-[440px] flex items-center justify-center overflow-hidden">
 
-      {/* Placeholder gradient shown until first image loads */}
-      <div className="absolute inset-0 bg-gradient-to-br from-gray-800 to-gray-900" />
+      {/* Placeholder gradient shown until first image loads — subtly
+          animated so a slow connection reads as "loading", not stuck */}
+      <div
+        className={`absolute inset-0 bg-gradient-to-br from-gray-800 to-gray-900 transition-opacity duration-700 ${
+          ready ? "opacity-0" : "opacity-100 animate-pulse"
+        }`}
+      />
 
       {/* All images stacked — only current one has opacity-100 */}
       {heroImages.map((src, i) => (

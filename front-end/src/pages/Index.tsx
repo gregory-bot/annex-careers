@@ -3,27 +3,8 @@ import { motion } from "framer-motion";
 import Layout from "@/components/Layout";
 import Hero from "@/components/Hero";
 import JobCard from "@/components/JobCard";
-import { useJobs, useStats } from "@/lib/jobStore";
-
-import { useMemo } from "react";
-
-/** Returns true if this looks like a real geographic location */
-function isValidLocation(loc: string): boolean {
-  if (!loc || loc.length < 2) return false;
-  // Exclude salary-like strings
-  if (/KSh|USD|\$|KES/i.test(loc)) return false;
-  // Exclude strings with comma-separated large numbers (salary patterns)
-  if (/\d{2,},\d{3}/.test(loc)) return false;
-  // Exclude "Confidential"
-  if (/^confidential$/i.test(loc.trim())) return false;
-  // Exclude concatenated garbage (contains job type keywords mashed in)
-  if (/full.?time|part.?time|contract|internship|education/i.test(loc)) return false;
-  // Exclude strings that are just numbers
-  if (/^\d+[\s\-,\d]*$/.test(loc)) return false;
-  // Must have letters
-  if (!/[a-zA-Z]/.test(loc)) return false;
-  return true;
-}
+import { useJobs, useStats, useCategories, useLocations } from "@/lib/jobStore";
+import { isValidLocation } from "@/lib/locationUtils";
 
 /** Capitalize a tag/category nicely */
 function formatTag(tag: string): string {
@@ -38,76 +19,36 @@ function formatTag(tag: string): string {
   return lower.charAt(0).toUpperCase() + lower.slice(1);
 }
 
+function CardSkeleton() {
+  return <div className="bg-card border border-border rounded-xl h-24 animate-pulse" />;
+}
+
 const Index = () => {
-  const { jobs: allJobs } = useJobs();
-  const apiStats = useStats();
-  const featuredJobs = allJobs.slice(0, 6);
+  const { jobs: featuredJobs, isLoading: featuredLoading, data: featuredPage } = useJobs({ page: 1, perPage: 6 });
+  const { stats: apiStats } = useStats();
+  const { categories: rawCategories, isLoading: categoriesLoading } = useCategories(8);
+  const { locations: rawLocations, isLoading: locationsLoading } = useLocations();
 
-  // Derive real stats from the jobs data
-  const { statsCards, categories, locations } = useMemo(() => {
-    const uniqueCompanies = new Set(allJobs.map((j) => j.company).filter(Boolean));
+  const locations = rawLocations.filter((l) => isValidLocation(l.name)).slice(0, 6);
 
-    const typeMap: Record<string, number> = {};
-    let remoteCount = 0;
-    allJobs.forEach((j) => {
-      if (j.type) {
-        const t = j.type.toLowerCase().trim();
-        typeMap[t] = (typeMap[t] || 0) + 1;
-      }
-      if (j.remote || j.type?.toLowerCase().includes("remote") || j.location?.toLowerCase().includes("remote")) {
-        remoteCount++;
-      }
-    });
+  const typeCounts: Record<string, number> = {};
+  Object.entries(apiStats?.job_type_counts ?? {}).forEach(([name, count]) => {
+    typeCounts[name.toLowerCase()] = count;
+  });
 
-    // Stats cards: simple numbers, no icons
-    const totalJobs = apiStats?.active_jobs ?? allJobs.length;
-    const fullTime = typeMap["full-time"] || typeMap["full time"] || 0;
-    const contractJobs = typeMap["contract"] || 0;
-    const partTime = typeMap["part-time"] || typeMap["part time"] || 0;
+  const totalJobs = apiStats?.active_jobs ?? 0;
+  const fullTime = typeCounts["full-time"] || typeCounts["full time"] || 0;
+  const contractJobs = typeCounts["contract"] || 0;
+  const partTime = typeCounts["part-time"] || typeCounts["part time"] || 0;
 
-    const cards = [
-      { label: "Total Jobs", value: totalJobs },
-      { label: "Remote", value: remoteCount },
-      { label: "Full-time", value: fullTime },
-      { label: "Contract", value: contractJobs },
-      { label: "Companies", value: uniqueCompanies.size },
-      ...(partTime > 0 ? [{ label: "Part-time", value: partTime }] : []),
-    ];
-
-    // Categories: split comma-separated tags and count
-    const catMap: Record<string, number> = {};
-    allJobs.forEach((job) => {
-      const cat = job.category;
-      if (cat) {
-        cat.split(",").forEach((c) => {
-          const trimmed = c.trim().toLowerCase();
-          if (trimmed) catMap[trimmed] = (catMap[trimmed] || 0) + 1;
-        });
-      }
-    });
-    const catList = Object.entries(catMap)
-      .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 8);
-
-    // Locations: only valid, real geographic locations
-    const locMap: Record<string, number> = {};
-    allJobs.forEach((job) => {
-      if (!job.location || !isValidLocation(job.location)) return;
-      const loc = job.location.trim();
-      locMap[loc] = (locMap[loc] || 0) + 1;
-    });
-    const locList = Object.values(
-      Object.entries(locMap).reduce<Record<string, { name: string; jobCount: number }>>((acc, [name, count]) => {
-        acc[name] = { name, jobCount: count };
-        return acc;
-      }, {})
-    )
-      .sort((a, b) => b.jobCount - a.jobCount)
-      .slice(0, 6);
-
-    return { statsCards: cards, categories: catList, locations: locList };
-  }, [allJobs, apiStats]);
+  const statsCards = [
+    { label: "Total Jobs", value: totalJobs },
+    { label: "Remote", value: apiStats?.remote_jobs ?? 0 },
+    { label: "Full-time", value: fullTime },
+    { label: "Contract", value: contractJobs },
+    { label: "Companies", value: apiStats?.companies ?? 0 },
+    ...(partTime > 0 ? [{ label: "Part-time", value: partTime }] : []),
+  ];
 
   return (
     <Layout>
@@ -120,8 +61,7 @@ const Index = () => {
             <motion.div
               key={stat.label}
               initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
+              animate={{ opacity: 1, y: 0 }}
               transition={{ delay: i * 0.08 }}
               className="bg-card border border-border rounded-xl p-5 text-center"
             >
@@ -144,19 +84,20 @@ const Index = () => {
           </Link>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {featuredJobs.map((job, i) => (
-            <motion.div
-              key={job.id}
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ delay: i * 0.05 }}
-            >
-              <JobCard job={job} />
-            </motion.div>
-          ))}
+          {featuredLoading
+            ? Array.from({ length: 6 }).map((_, i) => <CardSkeleton key={i} />)
+            : featuredJobs.map((job, i) => (
+                <motion.div
+                  key={job.id}
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: i * 0.05 }}
+                >
+                  <JobCard job={job} />
+                </motion.div>
+              ))}
         </div>
-        {allJobs.length > 6 && (
+        {(featuredPage?.total ?? 0) > 6 && (
           <div className="text-center mt-8">
             <Link
               to="/jobs"
@@ -173,25 +114,26 @@ const Index = () => {
         <div className="container py-12 sm:py-16 px-4">
           <h2 className="font-heading text-xl sm:text-2xl font-bold mb-6 sm:mb-8 text-center">Browse by Category</h2>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
-            {categories.map((cat, i) => (
-              <motion.div
-                key={cat.name}
-                initial={{ opacity: 0, scale: 0.95 }}
-                whileInView={{ opacity: 1, scale: 1 }}
-                viewport={{ once: true }}
-                transition={{ delay: i * 0.05 }}
-              >
-                <Link
-                  to={`/jobs?cat=${encodeURIComponent(cat.name)}`}
-                  className="bg-card border border-border rounded-xl p-4 sm:p-5 flex flex-col items-center text-center hover-lift block"
-                >
-                  <span className="font-heading font-semibold text-sm sm:text-base">
-                    {cat.name.split(",").map(formatTag).join(" · ")}
-                  </span>
-                  <span className="text-xs text-muted-foreground mt-1">{cat.count} jobs</span>
-                </Link>
-              </motion.div>
-            ))}
+            {categoriesLoading
+              ? Array.from({ length: 8 }).map((_, i) => <CardSkeleton key={i} />)
+              : rawCategories.map((cat, i) => (
+                  <motion.div
+                    key={cat.name}
+                    initial={{ opacity: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    transition={{ delay: i * 0.05 }}
+                  >
+                    <Link
+                      to={`/jobs?cat=${encodeURIComponent(cat.name)}`}
+                      className="bg-card border border-border rounded-xl p-4 sm:p-5 flex flex-col items-center text-center hover-lift block"
+                    >
+                      <span className="font-heading font-semibold text-sm sm:text-base">
+                        {cat.name.split(",").map(formatTag).join(" · ")}
+                      </span>
+                      <span className="text-xs text-muted-foreground mt-1">{cat.count} jobs</span>
+                    </Link>
+                  </motion.div>
+                ))}
           </div>
         </div>
       </section>
@@ -200,23 +142,24 @@ const Index = () => {
       <section className="container py-12 sm:py-16 px-4">
         <h2 className="font-heading text-xl sm:text-2xl font-bold mb-6 sm:mb-8 text-center">Popular Locations</h2>
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 sm:gap-4">
-          {locations.map((loc, i) => (
-            <motion.div
-              key={loc.name}
-              initial={{ opacity: 0, y: 10 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ delay: i * 0.05 }}
-            >
-              <Link
-                to={`/jobs?q=${encodeURIComponent(loc.name)}`}
-                className="bg-card border border-border rounded-xl p-4 text-center hover-lift block"
-              >
-                <p className="font-heading font-semibold text-sm">{loc.name}</p>
-                <p className="text-xs text-muted-foreground mt-1">{loc.jobCount} jobs</p>
-              </Link>
-            </motion.div>
-          ))}
+          {locationsLoading
+            ? Array.from({ length: 6 }).map((_, i) => <CardSkeleton key={i} />)
+            : locations.map((loc, i) => (
+                <motion.div
+                  key={loc.name}
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: i * 0.05 }}
+                >
+                  <Link
+                    to={`/jobs?q=${encodeURIComponent(loc.name)}`}
+                    className="bg-card border border-border rounded-xl p-4 text-center hover-lift block"
+                  >
+                    <p className="font-heading font-semibold text-sm">{loc.name}</p>
+                    <p className="text-xs text-muted-foreground mt-1">{loc.count} jobs</p>
+                  </Link>
+                </motion.div>
+              ))}
         </div>
       </section>
 

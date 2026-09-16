@@ -1,6 +1,6 @@
-import { useState, useMemo } from "react";
+import { useEffect, useState } from "react";
 import { useJobs } from "../lib/jobStore";
-import { Link, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { Search, ChevronDown, Loader2 } from "lucide-react";
 import { motion } from "framer-motion";
 import Layout from "@/components/Layout";
@@ -11,42 +11,66 @@ const locationFilters = ["All Locations", "Nairobi", "Mombasa", "Kisumu", "Eldor
 const dateFilters = ["Any time", "Last 24h", "Last 3 days", "Last week", "Last month"];
 const sortOptions = ["Most recent", "Salary (high to low)", "Relevance"];
 
+const PER_PAGE = 10;
+
+/** Debounce a fast-changing value so we don't fire a network request per keystroke. */
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(t);
+  }, [value, delayMs]);
+  return debounced;
+}
+
 const Jobs = () => {
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const initialQuery = searchParams.get("q") || "";
   const initialCat = searchParams.get("cat") || "";
   const initialType = searchParams.get("type") || "All";
+  const initialPage = Number(searchParams.get("page")) || 1;
 
-  const [search, setSearch] = useState(initialQuery || initialCat);
+  const [searchInput, setSearchInput] = useState(initialQuery || initialCat);
   const [selectedType, setSelectedType] = useState(initialType);
   const [selectedLocation, setSelectedLocation] = useState("All Locations");
   const [selectedDate, setSelectedDate] = useState("Any time");
   const [sortBy, setSortBy] = useState("Most recent");
-  const [showCount, setShowCount] = useState(8);
+  const [page, setPage] = useState(initialPage);
 
-  const { jobs: allJobs, loading } = useJobs();
+  const debouncedSearch = useDebouncedValue(searchInput, 400);
 
-  const filtered = useMemo(() => {
-    return allJobs.filter((job) => {
-      // Text search (matches title, company, description, or tags)
-      const q = search.toLowerCase();
-      const matchesSearch =
-        !search ||
-        job.title.toLowerCase().includes(q) ||
-        job.company.toLowerCase().includes(q) ||
-        job.description?.toLowerCase().includes(q) ||
-        job.category?.toLowerCase().includes(q);
-      // Job type filter
-      const matchesType =
-        selectedType === "All" ||
-        job.type?.toLowerCase() === selectedType.toLowerCase() ||
-        (selectedType.toLowerCase() === "remote" && (job.remote || job.type?.toLowerCase().includes("remote") || job.location?.toLowerCase().includes("remote")));
-      const matchesLocation =
-        selectedLocation === "All Locations" ||
-        job.location?.toLowerCase().includes(selectedLocation.toLowerCase());
-      return matchesSearch && matchesType && matchesLocation;
-    });
-  }, [search, selectedType, selectedLocation, allJobs]);
+  // Reset to page 1 whenever a filter actually changes the result set.
+  useEffect(() => {
+    setPage(1);
+  }, [debouncedSearch, selectedType, selectedLocation, sortBy]);
+
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams);
+    if (page > 1) next.set("page", String(page));
+    else next.delete("page");
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
+
+  const jobType = selectedType === "All" || selectedType === "Remote" ? undefined : selectedType;
+  const remote = selectedType === "Remote" ? true : undefined;
+  const location = selectedLocation === "All Locations" ? undefined : selectedLocation;
+  const sortBy_ = sortBy === "Salary (high to low)" ? "salary_min" : "scraped_at";
+  const sortOrder = "desc" as const;
+
+  const { jobs, isLoading, data } = useJobs({
+    page,
+    perPage: PER_PAGE,
+    search: debouncedSearch || undefined,
+    jobType,
+    remote,
+    location,
+    sortBy: sortBy_,
+    sortOrder,
+  });
+
+  const total = data?.total ?? 0;
+  const pages = data?.pages ?? 1;
 
   return (
     <Layout>
@@ -61,8 +85,8 @@ const Jobs = () => {
                 <input
                   type="text"
                   placeholder="Search by title, company..."
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
+                  value={searchInput}
+                  onChange={(e) => setSearchInput(e.target.value)}
                   className="flex-1 py-3 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none text-sm min-w-0"
                 />
               </div>
@@ -93,7 +117,7 @@ const Jobs = () => {
 
           <div className="flex flex-wrap gap-2 sm:gap-3 mb-6 sm:mb-8">
             <div className="relative">
-              <select title="Filter by category"
+              <select title="Filter by location"
                 value={selectedLocation}
                 onChange={(e) => setSelectedLocation(e.target.value)}
                 className="appearance-none bg-muted border border-border rounded-lg px-3 sm:px-4 py-2 pr-7 sm:pr-8 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
@@ -106,7 +130,7 @@ const Jobs = () => {
             </div>
 
             <div className="relative">
-              <select title="Filter by company"
+              <select title="Filter by date posted"
                 value={selectedDate}
                 onChange={(e) => setSelectedDate(e.target.value)}
                 className="appearance-none bg-muted border border-border rounded-lg px-3 sm:px-4 py-2 pr-7 sm:pr-8 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
@@ -119,7 +143,7 @@ const Jobs = () => {
             </div>
 
             <div className="relative sm:ml-auto">
-              <select title="Filter by location"
+              <select title="Sort by"
                 value={sortBy}
                 onChange={(e) => setSortBy(e.target.value)}
                 className="appearance-none bg-muted border border-border rounded-lg px-3 sm:px-4 py-2 pr-7 sm:pr-8 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
@@ -132,7 +156,7 @@ const Jobs = () => {
             </div>
           </div>
 
-          {loading ? (
+          {isLoading && jobs.length === 0 ? (
             <div className="text-center py-16">
               <Loader2 className="w-8 h-8 animate-spin text-primary mx-auto mb-3" />
               <p className="text-sm text-muted-foreground">Loading jobs...</p>
@@ -140,12 +164,12 @@ const Jobs = () => {
           ) : (
             <>
               <p className="text-sm text-muted-foreground mb-4 sm:mb-6">
-                Showing {Math.min(showCount, filtered.length)} of {filtered.length} jobs
+                Showing {jobs.length} of {total} jobs
               </p>
 
               {/* Job grid */}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
-                {filtered.slice(0, showCount).map((job, i) => (
+                {jobs.map((job, i) => (
                   <motion.div
                     key={job.id}
                     initial={{ opacity: 0, y: 15 }}
@@ -157,13 +181,30 @@ const Jobs = () => {
                 ))}
               </div>
 
-              {showCount < filtered.length && (
-                <div className="text-center">
+              {jobs.length === 0 && (
+                <p className="text-center text-sm text-muted-foreground py-12">
+                  No jobs match your filters.
+                </p>
+              )}
+
+              {pages > 1 && (
+                <div className="flex items-center justify-center gap-2">
                   <button
-                    onClick={() => setShowCount((c) => c + 6)}
-                    className="px-8 py-3 bg-primary text-primary-foreground rounded-xl font-medium text-sm hover:opacity-90 transition-opacity"
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    disabled={page <= 1}
+                    className="px-4 py-2 bg-muted text-foreground rounded-lg text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed hover:bg-muted/80"
                   >
-                    Load More
+                    Previous
+                  </button>
+                  <span className="text-sm text-muted-foreground px-2">
+                    Page {page} of {pages}
+                  </span>
+                  <button
+                    onClick={() => setPage((p) => Math.min(pages, p + 1))}
+                    disabled={page >= pages}
+                    className="px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90"
+                  >
+                    Next
                   </button>
                 </div>
               )}

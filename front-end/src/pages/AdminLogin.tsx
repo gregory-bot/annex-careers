@@ -1,22 +1,25 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-
-const ADMIN_USER = "greg-pipeline";
-const ADMIN_PASS = "Greg#3471@";
+import { Loader2 } from "lucide-react";
+import { adminLogin } from "@/lib/jobStore";
 
 const AdminLogin = () => {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const navigate = useNavigate();
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (username === ADMIN_USER && password === ADMIN_PASS) {
-      sessionStorage.setItem("annex_admin", "true");
+    setSubmitting(true);
+    try {
+      await adminLogin(username, password);
       navigate("/admin/dashboard");
-    } else {
-      toast.error("Invalid credentials");
+    } catch (err: any) {
+      toast.error(err.message || "Invalid credentials");
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -51,9 +54,10 @@ const AdminLogin = () => {
           </div>
           <button
             type="submit"
-            className="w-full py-2.5 bg-primary text-primary-foreground rounded-lg font-medium text-sm hover:opacity-90 transition-opacity"
+            disabled={submitting}
+            className="w-full py-2.5 bg-primary text-primary-foreground rounded-lg font-medium text-sm hover:opacity-90 transition-opacity disabled:opacity-60 flex items-center justify-center gap-2"
           >
-            Sign In
+            {submitting ? <><Loader2 size={16} className="animate-spin" /> Signing in...</> : "Sign In"}
           </button>
         </form>
       </div>

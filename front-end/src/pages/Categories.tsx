@@ -2,8 +2,7 @@ import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
 import { Loader2 } from "lucide-react";
 import Layout from "@/components/Layout";
-import { useJobs } from "@/lib/jobStore";
-import { useMemo } from "react";
+import { useCategories, useStats } from "@/lib/jobStore";
 
 /** Capitalize a tag/category nicely */
 function formatTag(tag: string): string {
@@ -18,30 +17,14 @@ function formatTag(tag: string): string {
 }
 
 const Categories = () => {
-  const { jobs, loading } = useJobs();
+  const { categories, isLoading: categoriesLoading } = useCategories();
+  const { stats, loading: statsLoading } = useStats();
+  const loading = categoriesLoading || statsLoading;
 
-  const { categories, jobTypes } = useMemo(() => {
-    const catMap: Record<string, number> = {};
-    const typeMap: Record<string, number> = {};
-    jobs.forEach((job) => {
-      const cat = job.category;
-      if (cat) {
-        cat.split(",").forEach((c) => {
-          const trimmed = c.trim().toLowerCase();
-          if (trimmed) catMap[trimmed] = (catMap[trimmed] || 0) + 1;
-        });
-      }
-      if (job.type) typeMap[job.type] = (typeMap[job.type] || 0) + 1;
-    });
-    return {
-      categories: Object.entries(catMap)
-        .map(([name, jobCount]) => ({ name, jobCount }))
-        .sort((a, b) => b.jobCount - a.jobCount),
-      jobTypes: Object.entries(typeMap)
-        .map(([name, count]) => ({ name, count }))
-        .sort((a, b) => b.count - a.count),
-    };
-  }, [jobs]);
+  const jobTypes = Object.entries(stats?.job_type_counts ?? {})
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count);
+
   return (
     <Layout>
       <div className="pt-28 md:pt-36 lg:pt-20">
@@ -74,7 +57,7 @@ const Categories = () => {
                  className="bg-card border border-border rounded-xl p-5 hover-lift flex flex-col items-center text-center block"
                  >
                    <h3 className="font-heading font-semibold text-sm sm:text-base">{formatTag(cat.name)}</h3>
-                  <p className="text-xs text-muted-foreground mt-1">{cat.jobCount} jobs</p>
+                  <p className="text-xs text-muted-foreground mt-1">{cat.count} jobs</p>
                 </Link>
               </motion.div>
             ))}

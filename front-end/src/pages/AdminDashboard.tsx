@@ -7,21 +7,12 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import {
-  useJobs, useStats,
+  useAllJobs, useStats,
   useScrapeLogsAdmin, useUsersAdmin,
   sendBulkAlerts, triggerScrapeAll, createJob,
+  getAdminToken, clearAdminToken,
 } from "@/lib/jobStore";
-
-function isValidLocation(loc: string): boolean {
-  if (!loc || loc.length < 2) return false;
-  if (/KSh|USD|\$|KES/i.test(loc)) return false;
-  if (/\d{2,},\d{3}/.test(loc)) return false;
-  if (/^confidential$/i.test(loc.trim())) return false;
-  if (/full.?time|part.?time|contract|internship|education/i.test(loc)) return false;
-  if (/^\d+[\s\-,\d]*$/.test(loc)) return false;
-  if (!/[a-zA-Z]/.test(loc)) return false;
-  return true;
-}
+import { isValidLocation } from "@/lib/locationUtils";
 
 type Tab = "dashboard" | "addjob" | "emails" | "logs";
 
@@ -31,11 +22,11 @@ const AdminDashboard = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useEffect(() => {
-    if (sessionStorage.getItem("annex_admin") !== "true") navigate("/admin");
+    if (!getAdminToken()) navigate("/admin");
   }, [navigate]);
 
   const handleLogout = () => {
-    sessionStorage.removeItem("annex_admin");
+    clearAdminToken();
     navigate("/admin");
   };
 
@@ -98,8 +89,8 @@ const AdminDashboard = () => {
 };
 
 function DashboardTab() {
-  const { jobs: allJobs, loading: jobsLoading } = useJobs();
-  const stats = useStats();
+  const { jobs: allJobs, isLoading: jobsLoading } = useAllJobs();
+  const { stats } = useStats();
   const [jobSearch, setJobSearch] = useState("");
   const [showAll, setShowAll] = useState(false);
   const INITIAL_COUNT = 20;
@@ -220,6 +211,7 @@ function AddJobTab() {
     company: "",
     location: "",
     description: "",
+    requirements: "",
     job_type: "Full-time",
     experience_level: "",
     remote: false,
@@ -241,13 +233,14 @@ function AddJobTab() {
         company: form.company.trim() || undefined,
         location: form.location.trim() || undefined,
         description: form.description.trim() || undefined,
+        requirements: form.requirements.trim() || undefined,
         experience_level: form.experience_level.trim() || undefined,
         apply_url: form.apply_url.trim() || undefined,
         tags: form.tags.trim() || undefined,
         application_deadline: form.application_deadline || undefined,
       });
       toast.success(`Job created (ID: ${result.job_id})`);
-      setForm({ title: "", company: "", location: "", description: "", job_type: "Full-time", experience_level: "", remote: false, apply_url: "", tags: "", application_deadline: "" });
+      setForm({ title: "", company: "", location: "", description: "", requirements: "", job_type: "Full-time", experience_level: "", remote: false, apply_url: "", tags: "", application_deadline: "" });
     } catch (err: any) {
       toast.error(err.message || "Failed to create job");
     } finally {
@@ -282,6 +275,18 @@ function AddJobTab() {
         <div>
           <label className="block text-sm font-medium mb-1">Job Description</label>
           <textarea value={form.description} onChange={(e) => update("description", e.target.value)} placeholder="Paste the job description here..." rows={5} className="w-full px-3 py-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary resize-y" />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium mb-1">Requirements</label>
+          <textarea
+            value={form.requirements}
+            onChange={(e) => update("requirements", e.target.value)}
+            placeholder={"One requirement per line, e.g.\nBachelor's degree in a related field\n3+ years of experience\nProficiency in SQL"}
+            rows={4}
+            className="w-full px-3 py-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary resize-y"
+          />
+          <p className="text-xs text-muted-foreground mt-1">One requirement per line — shown as a bullet list on the job page.</p>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -341,22 +346,33 @@ function AddJobTab() {
   );
 }
 
+const USERS_PER_PAGE = 100;
+
 function EmailTriggerTab() {
-  const { users, loading, refresh } = useUsersAdmin();
+  const [filter, setFilter] = useState<"all" | "subscribe" | "cv_upload">("all");
+  const [page, setPage] = useState(1);
+  const { users: filtered, total, pages, loading, refresh } = useUsersAdmin(
+    page,
+    USERS_PER_PAGE,
+    filter === "all" ? undefined : filter,
+  );
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [sending, setSending] = useState(false);
-  const [filter, setFilter] = useState<"all" | "subscribe" | "cv_upload">("all");
 
-  const filtered = useMemo(() => {
-    if (filter === "all") return users;
-    return users.filter((u) => u.source === filter);
-  }, [users, filter]);
+  const changeFilter = (f: "all" | "subscribe" | "cv_upload") => {
+    setFilter(f);
+    setPage(1);
+  };
 
   const toggleAll = () => {
-    if (selected.size === filtered.length) {
-      setSelected(new Set());
+    if (filtered.every((u) => selected.has(u.id)) && filtered.length > 0) {
+      const next = new Set(selected);
+      filtered.forEach((u) => next.delete(u.id));
+      setSelected(next);
     } else {
-      setSelected(new Set(filtered.map((u) => u.id)));
+      const next = new Set(selected);
+      filtered.forEach((u) => next.add(u.id));
+      setSelected(next);
     }
   };
 
@@ -404,19 +420,24 @@ function EmailTriggerTab() {
         </div>
       </div>
 
-      <div className="flex gap-2 mb-4">
-        {(["all", "subscribe", "cv_upload"] as const).map((f) => (
-          <button
-            key={f}
-            onClick={() => setFilter(f)}
-            className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-              filter === f ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            {f === "all" ? "All" : f === "subscribe" ? "Subscribers" : "CV Uploads"}
-            {f === "all" ? ` (${users.length})` : ` (${users.filter((u) => u.source === f).length})`}
-          </button>
-        ))}
+      <div className="flex items-center justify-between gap-2 mb-4 flex-wrap">
+        <div className="flex gap-2">
+          {(["all", "subscribe", "cv_upload"] as const).map((f) => (
+            <button
+              key={f}
+              onClick={() => changeFilter(f)}
+              className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
+                filter === f ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {f === "all" ? "All" : f === "subscribe" ? "Subscribers" : "CV Uploads"}
+              {filter === f ? ` (${total})` : ""}
+            </button>
+          ))}
+        </div>
+        {selected.size > 0 && (
+          <span className="text-xs text-muted-foreground">{selected.size} selected across pages</span>
+        )}
       </div>
 
       {loading ? (
@@ -432,7 +453,7 @@ function EmailTriggerTab() {
             <thead>
               <tr className="border-b border-border text-left">
                 <th className="px-4 py-3 w-10">
-                  <input type="checkbox" checked={selected.size === filtered.length && filtered.length > 0} onChange={toggleAll} className="rounded" />
+                  <input type="checkbox" checked={filtered.length > 0 && filtered.every((u) => selected.has(u.id))} onChange={toggleAll} className="rounded" />
                 </th>
                 <th className="px-4 py-3 font-medium text-muted-foreground">Email</th>
                 <th className="px-4 py-3 font-medium text-muted-foreground hidden sm:table-cell">Name</th>
@@ -464,6 +485,25 @@ function EmailTriggerTab() {
               ))}
             </tbody>
           </table>
+          {pages > 1 && (
+            <div className="flex items-center justify-center gap-2 py-3 border-t border-border">
+              <button
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page <= 1}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-muted disabled:opacity-40 disabled:cursor-not-allowed hover:bg-muted/80"
+              >
+                Previous
+              </button>
+              <span className="text-xs text-muted-foreground px-2">Page {page} of {pages}</span>
+              <button
+                onClick={() => setPage((p) => Math.min(pages, p + 1))}
+                disabled={page >= pages}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-primary text-primary-foreground disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90"
+              >
+                Next
+              </button>
+            </div>
+          )}
         </div>
       )}
     </>
