@@ -4,12 +4,13 @@ import os
 import sys
 from dotenv import load_dotenv
 
-# Set the project root and airflow-home directory
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-AIRFLOW_HOME = os.path.join(PROJECT_ROOT, 'airflow_home')
+# Set the workspace root and airflow-home directory
+BACKEND_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BACKEND_ROOT)
+AIRFLOW_HOME = os.path.join(BACKEND_ROOT, 'airflow_home')
 
 # Load .env file
-load_dotenv(os.path.join(AIRFLOW_HOME, '.env'))
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
 
     # Add airflow_home to PYTHONPATH
 if AIRFLOW_HOME not in sys.path:

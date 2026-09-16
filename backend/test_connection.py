@@ -8,9 +8,9 @@ import os
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config.settings import settings
-from database.connection import engine, init_db
-from database.models import Job, ScrapeLog
+from airflow_home.config.settings import settings
+from airflow_home.database.connection import engine, init_db
+from airflow_home.database.models import Job, ScrapeLog
 from sqlalchemy import text
 
 
@@ -21,6 +21,7 @@ def test_connection():
     print(f"Host: {settings.DB_HOST}")
     print(f"Port: {settings.DB_PORT}")
     print(f"Database: {settings.DB_NAME}")
+    print(f"Schema: {settings.DB_SCHEMA}")
     print(f"User: {settings.DB_USER}")
     print(f"SSL Mode: {settings.DB_SSLMODE}")
     print("-" * 60)
@@ -46,8 +47,9 @@ def test_connection():
             result = conn.execute(
                 text(
                     "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema = 'public' ORDER BY table_name"
-                )
+                    "WHERE table_schema = :schema ORDER BY table_name"
+                ),
+                {"schema": settings.DB_SCHEMA},
             )
             tables = [row[0] for row in result]
             print(f"Tables in database: {tables}")
