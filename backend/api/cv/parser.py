@@ -29,6 +29,14 @@ MONTH_YEAR_RANGE_RE = re.compile(
     r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(19|20)\d{2}",
     re.IGNORECASE,
 )
+PRESENT_RE = re.compile(r"\b(present|current|now)\b", re.IGNORECASE)
+DATE_RANGE_RE = re.compile(
+    r"(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+)?"
+    r"(?:19|20)\d{2}\s*(?:-|–|—|to)\s*"
+    r"(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+)?"
+    r"(?:(?:19|20)\d{2}|present|current|now)",
+    re.IGNORECASE,
+)
 DEGREE_KEYWORDS = (
     "bachelor", "bsc", "b.sc", "ba", "b.a", "msc", "m.sc", "mba", "phd",
     "diploma", "hnd", "certificate", "master", "associate degree",
@@ -149,12 +157,18 @@ def _is_entry_header(line: str) -> bool:
         return False
     if len(stripped) > 120:
         return False
-    return bool(YEAR_RANGE_RE.search(stripped) or MONTH_YEAR_RANGE_RE.search(stripped))
+    return bool(
+        DATE_RANGE_RE.search(stripped)
+        or YEAR_RANGE_RE.search(stripped)
+        or MONTH_YEAR_RANGE_RE.search(stripped)
+        or PRESENT_RE.search(stripped)
+    )
 
 
 def _parse_experience_block(block_lines: list[str]) -> list[ExperienceEntry]:
     entries: list[ExperienceEntry] = []
     current: ExperienceEntry | None = None
+    pending_bullet = False
     for line in block_lines:
         stripped = line.strip()
         if not stripped:
@@ -162,18 +176,31 @@ def _parse_experience_block(block_lines: list[str]) -> list[ExperienceEntry]:
         if _is_entry_header(stripped):
             if current:
                 entries.append(current)
-            date_match = YEAR_RANGE_RE.search(stripped) or MONTH_YEAR_RANGE_RE.search(stripped)
+            date_match = (
+                DATE_RANGE_RE.search(stripped)
+                or YEAR_RANGE_RE.search(stripped)
+                or MONTH_YEAR_RANGE_RE.search(stripped)
+                or PRESENT_RE.search(stripped)
+            )
             dates = date_match.group(0) if date_match else ""
             header_text = stripped.replace(dates, "").strip(" -,|–—")
-            parts = re.split(r",|\||–| at ", header_text, maxsplit=1)
+            parts = re.split(r",|\||\s+-\s+|–| at ", header_text, maxsplit=1)
             title = parts[0].strip()
             company = parts[1].strip() if len(parts) > 1 else ""
             current = ExperienceEntry(title=title or header_text, company=company, dates=dates)
         elif stripped.startswith("-"):
-            if current:
-                current.bullets.append(stripped.lstrip("- ").strip())
+            pending_bullet = not stripped.lstrip("- ").strip()
+            bullet = stripped.lstrip("- ").strip()
+            if current and bullet:
+                current.bullets.append(bullet)
         elif current:
-            current.bullets.append(stripped)
+            starts_new_sentence = bool(current.bullets and re.match(r"[A-Z0-9]", stripped))
+            previous_is_complete = bool(current.bullets and re.search(r"[.!?:;]$", current.bullets[-1]))
+            if pending_bullet or not current.bullets or (starts_new_sentence and previous_is_complete):
+                current.bullets.append(stripped)
+            else:
+                current.bullets[-1] = f"{current.bullets[-1]} {stripped}".strip()
+            pending_bullet = False
         else:
             # Content before any recognized entry header — keep as a
             # bulletless entry rather than silently dropping it.

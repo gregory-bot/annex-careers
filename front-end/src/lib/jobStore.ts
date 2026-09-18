@@ -404,10 +404,11 @@ export async function analyzeCv(file: File, jobId?: string): Promise<CvAnalysisR
   return res.json();
 }
 
-export async function generateAtsCv(file: File, jobId?: string): Promise<{ blob: Blob; filename: string }> {
+export async function generateAtsCv(file: File, jobId?: string, confirmedSkills?: string[]): Promise<{ blob: Blob; filename: string }> {
   const form = new FormData();
   form.append("file", file);
   if (jobId) form.append("job_id", jobId);
+  if (confirmedSkills && confirmedSkills.length > 0) form.append("confirmed_skills", confirmedSkills.join(","));
   const res = await fetch(`${API_BASE}/api/cv/generate`, { method: "POST", body: form });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to generate CV");
   const disposition = res.headers.get("Content-Disposition") || "";

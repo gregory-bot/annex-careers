@@ -1012,10 +1012,24 @@ async def analyze_cv(
 async def generate_cv(
     file: UploadFile = File(...),
     job_id: Optional[int] = Form(None),
+    confirmed_skills: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     content = await file.read()
     parsed, job, result, user_id = _prepare_cv_analysis(content, file.filename or "", job_id, db)
+
+    if confirmed_skills:
+        requested = {s.strip().lower() for s in confirmed_skills.split(",") if s.strip()}
+        # A user-confirmed "I actually have this" checkbox, not a free-text
+        # field: only skills the job itself asks for AND that were already
+        # flagged as missing can be added, so this can never be used to
+        # inject arbitrary claims into someone's CV.
+        added_skills = sorted(requested & set(result.missing_skills))
+        if added_skills:
+            existing_lower = {s.lower() for s in parsed.skills}
+            parsed.skills += [s for s in added_skills if s not in existing_lower]
+            result.matched_skills = sorted(set(result.matched_skills) | set(added_skills))
+
     _record_cv_submission(db, user_id, job_id, "generate", result, parsed)
 
     pdf_bytes = build_ats_cv_pdf(

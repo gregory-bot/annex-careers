@@ -19,6 +19,9 @@ def normalize_text(text: str) -> str:
     """Collapse repeated blank lines, normalize bullet characters, and cap length."""
     # Normalize common unicode bullets to a single "- " marker.
     text = re.sub(r"[•●▪◦‣∙]", "-", text)
+    # pdfplumber can expose ReportLab/PDF bullet glyphs as literal text.
+    text = re.sub(r"\(cid:\d+\)", "-", text)
+    text = re.sub(r"(?m)^\s*-\s*$\n(?=\S)", "- ", text)
     # Collapse 3+ blank lines down to 2 (one blank line between paragraphs).
     text = re.sub(r"\n{3,}", "\n\n", text)
     # Strip trailing whitespace on each line.
@@ -115,17 +118,17 @@ def extract_text_from_upload(filename: str, content: bytes) -> str:
             raise CvExtractionError(f"Could not read this PDF: {e}")
     elif ext == "doc":
         raise CvExtractionError(
-            "Legacy .doc files aren't supported — please save as .docx or .pdf and re-upload."
+            "Legacy .doc files aren't supported. Please save as .docx or .pdf and re-upload."
         )
     else:
         raise CvExtractionError(
-            "Unsupported file type — please upload a .pdf, .docx, or .txt file."
+            "Unsupported file type. Please upload a .pdf, .docx, or .txt file."
         )
 
     text = normalize_text(raw)
     if len(text) < 40:
         raise CvExtractionError(
-            "No readable text found in this file — if it's a scanned/image-only PDF, "
+            "No readable text found in this file. If it's a scanned/image-only PDF, "
             "please upload a text-based PDF or DOCX instead."
         )
     return text

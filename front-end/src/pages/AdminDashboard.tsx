@@ -286,7 +286,7 @@ function AddJobTab() {
             rows={4}
             className="w-full px-3 py-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary resize-y"
           />
-          <p className="text-xs text-muted-foreground mt-1">One requirement per line — shown as a bullet list on the job page.</p>
+          <p className="text-xs text-muted-foreground mt-1">One requirement per line. Shown as a bullet list on the job page.</p>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

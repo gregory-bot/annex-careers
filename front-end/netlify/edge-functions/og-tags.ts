@@ -1,6 +1,6 @@
 import type { Context } from "https://edge.netlify.com";
 
-const API_BASE = "https://jobs-data-pipeline.onrender.com";
+const API_BASE = "https://api.careers.annex-technologies.com";
 const SITE_URL = "https://annex-careers.netlify.app";
 const SITE_IMAGE = "https://i.pinimg.com/1200x/11/76/5e/11765ed3b9670d21f9ab4b84eb72d33d.jpg";
 

@@ -48,7 +48,7 @@ function getWelcomeMessage(targetJob: Job | null | undefined): Message {
   }
   return {
     role: "assistant",
-    content: `Welcome! Attach your CV using the + button, then:\n\n- Check Fit — get a match score and gap analysis (open this from a specific job page for the most useful results)\n- Generate ATS CV — get a clean, ATS-optimized rewrite of your CV as a PDF\n\nThis runs entirely on our servers — no data leaves Annex Careers.`,
+    content: `Welcome! Attach your CV using the + button, then:\n\n- Check Fit: get a match score and gap analysis (open this from a specific job page for the most useful results)\n- Generate ATS CV: get a clean, ATS-optimized rewrite of your CV as a PDF\n\nThis runs entirely on our servers. No data leaves Annex Careers.`,
   };
 }
 
@@ -59,7 +59,9 @@ function getScoreColor(score: number) {
 }
 
 // ── Styled analysis renderer ─────────────────────────
-function AnalysisCard({ data, jobTitle }: { data: CvAnalysisResult; jobTitle?: string }) {
+function AnalysisCard({
+  data, jobTitle, onGenerate, generating,
+}: { data: CvAnalysisResult; jobTitle?: string; onGenerate?: () => void; generating?: boolean }) {
   const sc = getScoreColor(data.score);
   return (
     <div className="w-full space-y-3">
@@ -83,7 +85,7 @@ function AnalysisCard({ data, jobTitle }: { data: CvAnalysisResult; jobTitle?: s
         <p className="text-sm leading-relaxed">{data.summary}</p>
         {data.low_confidence && (
           <p className="text-xs text-muted-foreground mt-2">
-            Note: this CV's layout was hard to parse automatically (confidence: {data.parse_confidence}%) — using clear
+            Note: this CV's layout was hard to parse automatically (confidence: {data.parse_confidence}%). Using clear
             section headers (Experience, Education, Skills) will improve accuracy.
           </p>
         )}
@@ -159,6 +161,17 @@ function AnalysisCard({ data, jobTitle }: { data: CvAnalysisResult; jobTitle?: s
           ))}
         </div>
       </div>
+
+      {onGenerate && (
+        <button
+          onClick={onGenerate}
+          disabled={!!generating}
+          className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground text-sm font-medium rounded-xl hover:opacity-90 transition-opacity disabled:opacity-50"
+        >
+          {generating ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
+          {generating ? "Generating..." : "Generate ATS CV from this"}
+        </button>
+      )}
     </div>
   );
 }
@@ -199,6 +212,12 @@ const Chat = () => {
   const [attachedFile, setAttachedFile] = useState<File | null>(null);
   const [loading, setLoading] = useState<"analyze" | "generate" | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [pendingGenerate, setPendingGenerate] = useState<{ file: File; missingSkills: string[] } | null>(null);
+  const [selectedSkills, setSelectedSkills] = useState<Set<string>>(new Set());
+  // Kept in memory only (not persisted) so a "Generate ATS CV from this"
+  // button can reuse the CV already uploaded for a Check Fit, without
+  // asking the user to attach the same file again.
+  const [lastFile, setLastFile] = useState<File | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -272,20 +291,18 @@ const Chat = () => {
     }
     const ext = file.name.split(".").pop()?.toLowerCase();
     if (!["pdf", "docx", "txt"].includes(ext || "")) {
-      setMessages((prev) => [...prev, { role: "assistant", content: "Unsupported file type — please upload a .pdf, .docx, or .txt file." }]);
+      setMessages((prev) => [...prev, { role: "assistant", content: "Unsupported file type. Please upload a .pdf, .docx, or .txt file." }]);
       return;
     }
     setAttachedFile(file);
   };
 
-  const runAction = async (action: "analyze" | "generate") => {
-    if (!attachedFile || loading) return;
-    const file = attachedFile;
+  const finalizeAction = async (action: "analyze" | "generate", file: File, confirmedSkills: string[] = []) => {
     const actionLabel = action === "analyze" ? "Check Fit" : "Generate ATS CV";
-    const userMsg: Message = { role: "user", content: `Uploaded "${file.name}" — ${actionLabel}${targetJob ? ` for "${targetJob.title}"` : ""}` };
+    const skillsNote = confirmedSkills.length > 0 ? ` (confirmed: ${confirmedSkills.join(", ")})` : "";
+    const userMsg: Message = { role: "user", content: `Uploaded "${file.name}": ${actionLabel}${targetJob ? ` for "${targetJob.title}"` : ""}${skillsNote}` };
     const newMessages = [...messages, userMsg];
     setMessages(newMessages);
-    setAttachedFile(null);
     setLoading(action);
 
     try {
@@ -293,7 +310,7 @@ const Chat = () => {
         const result = await analyzeCv(file, jobId ?? undefined);
         setMessages([...newMessages, { role: "assistant", analysis: result }]);
       } else {
-        const { blob, filename } = await generateAtsCv(file, jobId ?? undefined);
+        const { blob, filename } = await generateAtsCv(file, jobId ?? undefined, confirmedSkills);
         const url = URL.createObjectURL(blob);
         setMessages([...newMessages, {
           role: "assistant",
@@ -307,6 +324,68 @@ const Chat = () => {
       setLoading(null);
     }
   };
+
+  const startGenerate = async (file: File) => {
+    // Generating for a specific job: check which of that job's required
+    // skills are missing from the CV first, so the user can explicitly
+    // confirm any they actually have before we add them — the tool never
+    // adds a skill on its own.
+    if (jobId) {
+      setLoading("generate");
+      try {
+        const preview = await analyzeCv(file, jobId);
+        setLoading(null);
+        if (preview.missing_skills.length > 0) {
+          setPendingGenerate({ file, missingSkills: preview.missing_skills });
+          setSelectedSkills(new Set());
+          return;
+        }
+      } catch (err: any) {
+        setLoading(null);
+        setMessages((prev) => [...prev, { role: "assistant", content: err.message || "Something went wrong. Please try again." }]);
+        return;
+      }
+    }
+
+    await finalizeAction("generate", file);
+  };
+
+  const runAction = async (action: "analyze" | "generate") => {
+    if (!attachedFile || loading) return;
+    const file = attachedFile;
+    setAttachedFile(null);
+    setLastFile(file);
+
+    if (action === "analyze") {
+      await finalizeAction("analyze", file);
+    } else {
+      await startGenerate(file);
+    }
+  };
+
+  const regenerateFromLastFile = () => {
+    if (!lastFile || loading) return;
+    startGenerate(lastFile);
+  };
+
+  const toggleSkill = (skill: string) => {
+    setSelectedSkills((prev) => {
+      const next = new Set(prev);
+      if (next.has(skill)) next.delete(skill);
+      else next.add(skill);
+      return next;
+    });
+  };
+
+  const confirmGenerate = async () => {
+    if (!pendingGenerate) return;
+    const { file } = pendingGenerate;
+    const confirmedSkills = Array.from(selectedSkills);
+    setPendingGenerate(null);
+    await finalizeAction("generate", file, confirmedSkills);
+  };
+
+  const cancelPendingGenerate = () => setPendingGenerate(null);
 
   const startNewSession = () => {
     const id = generateSessionId();
@@ -464,10 +543,16 @@ const Chat = () => {
                 }
 
                 if (msg.analysis) {
+                  const isLatest = i === messages.length - 1;
                   return (
                     <div key={i} className="flex justify-start">
                       <div className="max-w-[95%] sm:max-w-[85%]">
-                        <AnalysisCard data={msg.analysis} jobTitle={targetJob?.title} />
+                        <AnalysisCard
+                          data={msg.analysis}
+                          jobTitle={targetJob?.title}
+                          onGenerate={isLatest && lastFile ? regenerateFromLastFile : undefined}
+                          generating={isLatest && loading === "generate"}
+                        />
                       </div>
                     </div>
                   );
@@ -500,7 +585,46 @@ const Chat = () => {
             <div className="px-4 pb-3 border-t border-border bg-card shrink-0 pt-3">
               <input ref={fileInputRef} type="file" accept={ACCEPTED_TYPES} onChange={handleFileUpload} className="hidden" title="Upload CV or resume" />
 
-              {attachedFile ? (
+              {pendingGenerate ? (
+                <div className="space-y-3 p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-xl">
+                  <p className="text-xs leading-relaxed text-foreground">
+                    {targetJob?.title ? <strong>{targetJob.title}</strong> : "This role"} also asks for these skills, which
+                    weren't found in your CV. Only select the ones you genuinely have. We'll never add a skill you
+                    haven't confirmed.
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {pendingGenerate.missingSkills.map((skill) => (
+                      <label
+                        key={skill}
+                        className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs cursor-pointer border transition-colors ${
+                          selectedSkills.has(skill)
+                            ? "bg-primary text-primary-foreground border-primary"
+                            : "bg-background border-border hover:border-primary/50"
+                        }`}
+                      >
+                        <input type="checkbox" className="hidden" checked={selectedSkills.has(skill)} onChange={() => toggleSkill(skill)} />
+                        {skill}
+                      </label>
+                    ))}
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={cancelPendingGenerate}
+                      disabled={!!loading}
+                      className="flex-1 px-4 py-2.5 text-sm font-medium rounded-xl border border-border hover:bg-muted transition-colors disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={confirmGenerate}
+                      disabled={!!loading}
+                      className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground text-sm font-medium rounded-xl hover:opacity-90 transition-opacity disabled:opacity-50"
+                    >
+                      <Sparkles size={16} /> Generate{selectedSkills.size > 0 ? ` (+${selectedSkills.size})` : ""}
+                    </button>
+                  </div>
+                </div>
+              ) : attachedFile ? (
                 <div className="space-y-2">
                   <div className="flex items-center gap-2 px-3 py-2 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-xl">
                     <FileText size={14} className="text-blue-600 shrink-0" />

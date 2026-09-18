@@ -110,29 +110,29 @@ def analyze(parsed: ParsedCV, job_keywords: set[str] | None, job_title: str = ""
     if len(parsed.experience) > 0:
         strengths.append(f"You've listed {len(parsed.experience)} work experience {'entry' if len(parsed.experience) == 1 else 'entries'}, which gives concrete evidence of your background.")
     if any(any(ch.isdigit() for ch in b) for e in parsed.experience for b in e.bullets):
-        strengths.append("Some of your bullet points include numbers — quantified achievements stand out to both recruiters and ATS systems.")
+        strengths.append("Some of your bullet points include numbers. Quantified achievements stand out to both recruiters and ATS systems.")
     if not strengths:
-        strengths.append("Your CV was received and processed — add more detail to your Skills and Experience sections to strengthen this analysis.")
+        strengths.append("Your CV was received and processed. Add more detail to your Skills and Experience sections to strengthen this analysis.")
 
     gaps = []
     for skill in sorted(missing)[:8]:
-        gaps.append(f"No mention of \"{skill}\" — this job asks for it but it wasn't found anywhere in your CV.")
+        gaps.append(f"No mention of \"{skill}\": this job asks for it but it wasn't found anywhere in your CV.")
     if not parsed.experience:
-        gaps.append("No work experience section was detected — make sure it's clearly labeled (e.g. \"Experience\").")
+        gaps.append("No work experience section was detected. Make sure it's clearly labeled (e.g. \"Experience\").")
     if len(parsed.skills) < 3:
-        gaps.append("Fewer than 3 skills were detected — consider adding a dedicated Skills section.")
+        gaps.append("Fewer than 3 skills were detected. Consider adding a dedicated Skills section.")
 
     recommendations = []
     if missing:
-        recommendations.append(f"If you have experience with {', '.join(sorted(missing)[:5])}, add it explicitly — ATS systems and recruiters scan for exact keyword matches.")
+        recommendations.append(f"If you have experience with {', '.join(sorted(missing)[:5])}, add it explicitly. ATS systems and recruiters scan for exact keyword matches.")
     if not any(any(ch.isdigit() for ch in b) for e in parsed.experience for b in e.bullets):
         recommendations.append("Add quantifiable outcomes to your experience bullets (e.g. \"increased sales by 20%\", \"managed a team of 5\").")
     if not parsed.summary:
         recommendations.append("Add a short professional summary at the top of your CV tailored to the role you're applying for.")
     if parsed.low_confidence:
-        recommendations.append("Your CV's structure was hard to parse automatically — using clear section headers (SUMMARY, EXPERIENCE, EDUCATION, SKILLS) will help both this tool and real ATS software read it correctly.")
+        recommendations.append("Your CV's structure was hard to parse automatically. Using clear section headers (SUMMARY, EXPERIENCE, EDUCATION, SKILLS) will help both this tool and real ATS software read it correctly.")
     if not recommendations:
-        recommendations.append("Your CV is well-structured — keep it updated with your most recent achievements.")
+        recommendations.append("Your CV is well-structured. Keep it updated with your most recent achievements.")
 
     summary_bits = [f"Match score: {final_score}/100."]
     if job_title:
@@ -162,3 +162,29 @@ def build_phrase_for_skills(skills: list[str]) -> str:
         if category and category in PHRASE_BANK:
             return PHRASE_BANK[category]
     return PHRASE_BANK["default"]
+
+
+# Generic, role-agnostic signals of transferable capability — independent of
+# any one job's technical keyword list. Used only to reorder a candidate's
+# own real bullets/skills toward the top when they're relevant across roles
+# (e.g. a career switcher's "collaborated with stakeholders" bullet), never
+# to add or rewrite a claim they didn't already write themselves.
+TRANSFERABLE_SIGNAL_RE = re.compile(
+    r"\b("
+    r"collaborat\w*|cross-functional|cross functional|stakeholder\w*|"
+    r"communicat\w*|presented|presentation\w*|mentor\w*|coach\w*|"
+    r"leadership|led|coordinat\w*|problem[- ]solv\w*|"
+    r"user research|user feedback|customer feedback|client\w*|"
+    r"research\w*|iterat\w*|usability|requirement\w*|document\w*|"
+    r"planning|organi[sz]\w*|prioriti[sz]\w*|"
+    r"attention to detail|process improvement|"
+    r"negotiat\w*|facilitat\w*"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def has_transferable_signal(text: str) -> bool:
+    """True if text shows a generic transferable-skill signal (collaboration,
+    stakeholder work, research, etc.), independent of any specific job."""
+    return bool(TRANSFERABLE_SIGNAL_RE.search(text))

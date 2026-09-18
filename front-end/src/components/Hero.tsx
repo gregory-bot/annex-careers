@@ -14,6 +14,12 @@ const heroImages = [
 
 const SLIDE_INTERVAL = 10000;
 const FADE_MS = 10000;
+// The very first image reveal must be fast — FADE_MS is only meant for the
+// ambient crossfade between already-visible slides. Reusing it for the
+// initial appearance meant a freshly loaded hero image took a full 10s to
+// fade from invisible to visible, reading as "the image isn't showing" to
+// anyone who looks at the page (or takes a screenshot) right after a reload.
+const REVEAL_MS = 700;
 
 /** Preload an image and return a promise */
 function preloadImage(src: string): Promise<void> {
@@ -29,6 +35,7 @@ const Hero = () => {
   const [current, setCurrent] = useState(0);
   const [loaded, setLoaded] = useState<boolean[]>(() => heroImages.map(() => false));
   const [ready, setReady] = useState(false);
+  const [hasRevealed, setHasRevealed] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval>>();
 
   // Preload all images on mount
@@ -60,6 +67,14 @@ const Hero = () => {
       setCurrent((prev) => (prev + 1) % heroImages.length);
     }, SLIDE_INTERVAL);
     return () => clearInterval(timerRef.current);
+  }, [ready]);
+
+  // Switch from the fast initial reveal to the slow ambient crossfade only
+  // once that reveal has actually had time to finish.
+  useEffect(() => {
+    if (!ready) return;
+    const t = setTimeout(() => setHasRevealed(true), REVEAL_MS);
+    return () => clearTimeout(t);
   }, [ready]);
 
   // Memoised to avoid re-creating on each render
@@ -95,7 +110,7 @@ const Hero = () => {
           className={`absolute inset-0 w-full h-full object-cover transition-opacity ease-in-out ${
             i === current && loaded[i] ? "opacity-100" : "opacity-0"
           }`}
-          style={{ transitionDuration: `${FADE_MS}ms` }}
+          style={{ transitionDuration: `${hasRevealed ? FADE_MS : REVEAL_MS}ms` }}
         />
       ))}
 
