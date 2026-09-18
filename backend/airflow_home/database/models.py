@@ -128,3 +128,21 @@ class CVSubmission(Base):
 
     def __repr__(self):
         return f"<CVSubmission(user_id={self.user_id}, job_id={self.job_id}, action='{self.action}')>"
+
+
+class AnalyticsEvent(Base):
+    """Immutable product events used for traffic and application analytics."""
+    __tablename__ = "analytics_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_type = Column(String(40), nullable=False)  # 'page_view' or 'apply_click'
+    job_id = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    session_id = Column(String(120), nullable=True)
+    referrer = Column(String(1000), nullable=True)
+    user_agent = Column(String(1000), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_analytics_events_type_created", "event_type", "created_at"),
+        Index("ix_analytics_events_job_type", "job_id", "event_type"),
+    )

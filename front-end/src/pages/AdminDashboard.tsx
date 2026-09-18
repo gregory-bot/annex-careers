@@ -3,12 +3,13 @@ import { useNavigate } from "react-router-dom";
 import {
   LogOut, LayoutDashboard, Mail, Activity, Search,
   ChevronDown, ChevronUp, Loader2, Send, RefreshCw,
-  Users, Menu, X, PlusCircle,
+  Users, Menu, X, PlusCircle, Eye, MousePointerClick,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
   useAllJobs, useStats,
   useScrapeLogsAdmin, useUsersAdmin,
+  useAdminAnalytics,
   sendBulkAlerts, triggerScrapeAll, createJob,
   getAdminToken, clearAdminToken,
 } from "@/lib/jobStore";
@@ -91,6 +92,7 @@ const AdminDashboard = () => {
 function DashboardTab() {
   const { jobs: allJobs, isLoading: jobsLoading } = useAllJobs();
   const { stats } = useStats();
+  const { analytics, loading: analyticsLoading } = useAdminAnalytics();
   const [jobSearch, setJobSearch] = useState("");
   const [showAll, setShowAll] = useState(false);
   const INITIAL_COUNT = 20;
@@ -121,6 +123,47 @@ function DashboardTab() {
 
   return (
     <>
+      <div className="mb-6">
+        <h2 className="font-heading font-bold text-xl">Traffic overview</h2>
+        <p className="text-sm text-muted-foreground">Views and outbound application activity across the platform.</p>
+      </div>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+        <TrafficCard label="Total page views" value={analytics?.page_views.total} icon={<Eye size={17} />} accent />
+        <TrafficCard label="Views this week" value={analytics?.page_views.this_week} icon={<Eye size={17} />} />
+        <TrafficCard label="Views today" value={analytics?.page_views.today} icon={<Eye size={17} />} />
+        <TrafficCard label="Application link clicks" value={analytics?.apply_clicks.total} icon={<MousePointerClick size={17} />} />
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 mb-6">
+        <AnalyticsList
+          title="Clicks by job type"
+          entries={analytics?.job_types ?? []}
+          loading={analyticsLoading}
+        />
+        <AnalyticsList
+          title="Clicks by source"
+          entries={analytics?.sources ?? []}
+          loading={analyticsLoading}
+        />
+        <div className="bg-card border border-border rounded-xl p-4">
+          <h3 className="font-heading font-semibold text-sm mb-3">Top jobs by applications</h3>
+          {analyticsLoading ? <Loader2 className="w-5 h-5 animate-spin text-primary mx-auto my-8" /> : analytics?.top_jobs.length ? (
+            <div className="space-y-3">
+              {analytics.top_jobs.slice(0, 5).map((entry, index) => (
+                <div key={entry.id} className="flex items-start gap-3">
+                  <span className="text-xs font-bold text-muted-foreground w-4">{index + 1}</span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium truncate">{entry.title}</p>
+                    <p className="text-xs text-muted-foreground truncate">{entry.company || "Company not listed"}</p>
+                  </div>
+                  <span className="text-sm font-semibold">{entry.count}</span>
+                </div>
+              ))}
+            </div>
+          ) : <p className="text-sm text-muted-foreground py-6 text-center">No application clicks yet.</p>}
+        </div>
+      </div>
+
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
         <StatCard label="Total Jobs" value={stats?.total_jobs ?? allJobs.length} />
         <StatCard label="Active Jobs" value={stats?.active_jobs ?? allJobs.length} />
@@ -201,6 +244,41 @@ function DashboardTab() {
         </>
       )}
     </>
+  );
+}
+
+function TrafficCard({ label, value, icon, accent = false }: { label: string; value?: number; icon: React.ReactNode; accent?: boolean }) {
+  return (
+    <div className={`border rounded-xl p-4 ${accent ? "bg-primary text-primary-foreground border-primary" : "bg-card border-border"}`}>
+      <div className={`flex items-center gap-2 text-xs uppercase tracking-wide ${accent ? "text-primary-foreground/80" : "text-muted-foreground"}`}>
+        {icon} {label}
+      </div>
+      <p className="font-heading text-2xl font-bold mt-2">{value === undefined ? "-" : value.toLocaleString()}</p>
+    </div>
+  );
+}
+
+function AnalyticsList({ title, entries, loading }: { title: string; entries: Array<{ name: string; count: number }>; loading: boolean }) {
+  const maximum = Math.max(...entries.map((entry) => entry.count), 1);
+  return (
+    <div className="bg-card border border-border rounded-xl p-4">
+      <h3 className="font-heading font-semibold text-sm mb-4">{title}</h3>
+      {loading ? <Loader2 className="w-5 h-5 animate-spin text-primary mx-auto my-8" /> : entries.length ? (
+        <div className="space-y-3">
+          {entries.slice(0, 6).map((entry) => (
+            <div key={entry.name}>
+              <div className="flex justify-between gap-3 text-xs mb-1">
+                <span className="truncate">{entry.name}</span>
+                <span className="font-semibold">{entry.count}</span>
+              </div>
+              <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+                <div className="h-full bg-primary rounded-full" style={{ width: `${(entry.count / maximum) * 100}%` }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : <p className="text-sm text-muted-foreground py-6 text-center">No application clicks yet.</p>}
+    </div>
   );
 }
 

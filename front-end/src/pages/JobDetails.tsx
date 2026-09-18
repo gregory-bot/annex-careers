@@ -1,8 +1,9 @@
 import { useParams, Link } from "react-router-dom";
+import { useEffect } from "react";
 import { ArrowLeft, MapPin, Briefcase, Clock, ExternalLink, Share2, CalendarClock, Building2, Loader2, FileCheck } from "lucide-react";
 import Layout from "@/components/Layout";
 import JobCard from "@/components/JobCard";
-import { useJob, useAllJobs } from "@/lib/jobStore";
+import { useJob, useAllJobs, trackAnalyticsEvent } from "@/lib/jobStore";
 import { toast } from "sonner";
 
 function formatDate(dateStr: string): string {
@@ -67,6 +68,10 @@ const JobDetails = () => {
   const { job, isLoading: loading } = useJob(id);
   const { jobs: allJobs } = useAllJobs();
 
+  useEffect(() => {
+    if (job) void trackAnalyticsEvent("page_view", job.id);
+  }, [job]);
+
   if (loading) {
     return (
       <Layout>
@@ -99,6 +104,10 @@ const JobDetails = () => {
   const applyLink = job.apply_url || job.url || "#";
   const hasDescription = job.description && job.description.trim().length > 0;
   const hasRequirements = job.requirements && job.requirements.length > 0;
+
+  const handleApplyClick = () => {
+    void trackAnalyticsEvent("apply_click", job.id);
+  };
 
   return (
     <Layout>
@@ -151,7 +160,7 @@ const JobDetails = () => {
                   <div className="text-sm text-muted-foreground mb-6 bg-muted/50 rounded-lg p-4">
                     <p className="mb-2">No description available for this position.</p>
                     {applyLink !== "#" && (
-                      <a href={applyLink} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline font-medium inline-flex items-center gap-1">
+                      <a href={applyLink} target="_blank" rel="noopener noreferrer" onClick={handleApplyClick} className="text-primary hover:underline font-medium inline-flex items-center gap-1">
                         <ExternalLink size={14} /> Click here for full job details
                       </a>
                     )}
@@ -176,7 +185,7 @@ const JobDetails = () => {
                     <div className="text-sm text-muted-foreground mb-6 bg-muted/50 rounded-lg p-4">
                       <p className="mb-2">Requirements not listed for this position.</p>
                       {applyLink !== "#" && (
-                        <a href={applyLink} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline font-medium inline-flex items-center gap-1">
+                        <a href={applyLink} target="_blank" rel="noopener noreferrer" onClick={handleApplyClick} className="text-primary hover:underline font-medium inline-flex items-center gap-1">
                           <ExternalLink size={14} /> Click here for full job details
                         </a>
                       )}
@@ -203,6 +212,7 @@ const JobDetails = () => {
                     href={applyLink}
                     target="_blank"
                     rel="noopener noreferrer"
+                    onClick={handleApplyClick}
                     className="w-full flex items-center justify-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-xl font-medium text-sm hover:opacity-90 transition-opacity"
                   >
                     <ExternalLink size={16} /> Apply Now

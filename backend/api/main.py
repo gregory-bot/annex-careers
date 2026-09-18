@@ -15,7 +15,7 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, Query, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, Query, HTTPException, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
@@ -27,7 +27,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from airflow_home.database.connection import get_db, init_db, SessionLocal
-from airflow_home.database.models import Job, ScrapeLog, User, UserJobNotification, CVSubmission
+from airflow_home.database.models import Job, ScrapeLog, User, UserJobNotification, CVSubmission, AnalyticsEvent
 from airflow_home.config.settings import settings
 from api.cv.extract import extract_text_from_upload, CvExtractionError
 from api.cv.parser import parse_cv
@@ -128,6 +128,13 @@ class CreateJobRequest(BaseModel):
 class AdminLoginRequest(BaseModel):
     username: str
     password: str
+
+
+class AnalyticsEventRequest(BaseModel):
+    event_type: str
+    job_id: Optional[int] = None
+    session_id: Optional[str] = None
+    referrer: Optional[str] = None
 
 
 # --- Admin auth ---
@@ -372,6 +379,89 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return JobResponse.from_orm(job)
+
+
+@app.post("/api/analytics/events", status_code=201)
+def record_analytics_event(
+    req: AnalyticsEventRequest,
+    db: Session = Depends(get_db),
+    user_agent: Optional[str] = Header(None),
+):
+    if req.event_type not in {"page_view", "apply_click"}:
+        raise HTTPException(status_code=400, detail="Unsupported analytics event")
+    if req.event_type == "apply_click" and req.job_id is None:
+        raise HTTPException(status_code=400, detail="job_id is required for apply_click")
+    if req.job_id is not None and not db.query(Job.id).filter(Job.id == req.job_id).first():
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    db.add(AnalyticsEvent(
+        event_type=req.event_type,
+        job_id=req.job_id,
+        session_id=req.session_id,
+        referrer=req.referrer,
+        user_agent=user_agent,
+    ))
+    db.commit()
+    return {"recorded": True}
+
+
+@app.get("/api/admin/analytics")
+def get_admin_analytics(db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_start - timedelta(days=6)
+
+    def count_events(event_type: str, start=None):
+        query = db.query(func.count(AnalyticsEvent.id)).filter(AnalyticsEvent.event_type == event_type)
+        if start:
+            query = query.filter(AnalyticsEvent.created_at >= start)
+        return query.scalar() or 0
+
+    click_filter = AnalyticsEvent.event_type == "apply_click"
+    job_type_rows = (
+        db.query(Job.job_type, func.count(AnalyticsEvent.id))
+        .join(AnalyticsEvent, AnalyticsEvent.job_id == Job.id)
+        .filter(click_filter)
+        .group_by(Job.job_type)
+        .order_by(desc(func.count(AnalyticsEvent.id)))
+        .all()
+    )
+    source_rows = (
+        db.query(Job.source, func.count(AnalyticsEvent.id))
+        .join(AnalyticsEvent, AnalyticsEvent.job_id == Job.id)
+        .filter(click_filter)
+        .group_by(Job.source)
+        .order_by(desc(func.count(AnalyticsEvent.id)))
+        .all()
+    )
+    top_job_rows = (
+        db.query(Job.id, Job.title, Job.company, Job.job_type, func.count(AnalyticsEvent.id))
+        .join(AnalyticsEvent, AnalyticsEvent.job_id == Job.id)
+        .filter(click_filter)
+        .group_by(Job.id, Job.title, Job.company, Job.job_type)
+        .order_by(desc(func.count(AnalyticsEvent.id)))
+        .limit(10)
+        .all()
+    )
+
+    return {
+        "page_views": {
+            "total": count_events("page_view"),
+            "today": count_events("page_view", today_start),
+            "this_week": count_events("page_view", week_start),
+        },
+        "apply_clicks": {
+            "total": count_events("apply_click"),
+            "today": count_events("apply_click", today_start),
+            "this_week": count_events("apply_click", week_start),
+        },
+        "job_types": [{"name": name or "Not specified", "count": count} for name, count in job_type_rows],
+        "sources": [{"name": name or "Unknown", "count": count} for name, count in source_rows],
+        "top_jobs": [
+            {"id": job_id, "title": title, "company": company, "job_type": job_type, "count": count}
+            for job_id, title, company, job_type, count in top_job_rows
+        ],
+    }
 
 
 @app.post("/api/jobs")

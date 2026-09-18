@@ -33,6 +33,14 @@ export interface Stats {
   }>;
 }
 
+export interface AdminAnalytics {
+  page_views: { total: number; today: number; this_week: number };
+  apply_clicks: { total: number; today: number; this_week: number };
+  job_types: Array<{ name: string; count: number }>;
+  sources: Array<{ name: string; count: number }>;
+  top_jobs: Array<{ id: number; title: string; company: string | null; job_type: string | null; count: number }>;
+}
+
 export interface FacetEntry {
   name: string;
   count: number;
@@ -327,6 +335,37 @@ export function useUsersAdmin(page = 1, perPage = 50, source?: string) {
     loading: query.isLoading,
     refresh: query.refetch,
   };
+}
+
+export function useAdminAnalytics() {
+  const query = useQuery({
+    queryKey: ["admin", "analytics"],
+    queryFn: async (): Promise<AdminAnalytics> => {
+      const res = await adminFetch("/api/admin/analytics");
+      if (!res.ok) throw new Error("Failed to load analytics");
+      return res.json();
+    },
+    staleTime: 60_000,
+  });
+  return { analytics: query.data ?? null, loading: query.isLoading, refresh: query.refetch };
+}
+
+export function trackAnalyticsEvent(eventType: "page_view" | "apply_click", jobId?: string) {
+  const sessionKey = "annex_analytics_session";
+  let sessionId = "";
+  try {
+    sessionId = sessionStorage.getItem(sessionKey) ?? crypto.randomUUID();
+    sessionStorage.setItem(sessionKey, sessionId);
+  } catch {
+    // Analytics should never block browsing when storage is unavailable.
+  }
+
+  return fetch(`${API_BASE}/api/analytics/events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event_type: eventType, job_id: jobId ? Number(jobId) : undefined, session_id: sessionId, referrer: document.referrer || undefined }),
+    keepalive: true,
+  }).catch(() => undefined);
 }
 
 export async function sendBulkAlerts(userIds: number[]): Promise<{ sent: number }> {
