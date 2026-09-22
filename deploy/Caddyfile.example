@@ -16,8 +16,8 @@ careers.annex-technologies.com {
     }
     handle @job_link_bots {
         rewrite * /share/jobs/{re.job.1}
-        reverse_proxy https://api.careers.annex-technologies.com {
-            header_up Host api.careers.annex-technologies.com
+        reverse_proxy https://annex-careers.onrender.com {
+            header_up Host annex-careers.onrender.com
         }
     }
 

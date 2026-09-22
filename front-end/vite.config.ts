@@ -13,7 +13,7 @@ export default defineConfig(() => ({
     },
     proxy: {
       "/api": {
-        target: "https://api.careers.annex-technologies.com",
+        target: "https://annex-careers.onrender.com",
         changeOrigin: true,
         secure: true,
       },

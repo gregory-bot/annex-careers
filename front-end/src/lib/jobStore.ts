@@ -71,7 +71,9 @@ export interface FacetEntry {
 
 import { useQuery, keepPreviousData, type UseQueryResult } from "@tanstack/react-query";
 
-export const API_BASE = import.meta.env.VITE_API_URL ?? "https://api.careers.annex-technologies.com";
+// Production builds read VITE_API_URL from the repo-root .env.production; local dev from .env.
+// The fallback is the live Render API.
+export const API_BASE = (import.meta.env.VITE_API_URL ?? "https://annex-careers.onrender.com").replace(/\/+$/, "");
 
 // --- Admin auth ---
 

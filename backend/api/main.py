@@ -48,9 +48,12 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# ── CORS — only the production domain + local dev ───────────────────────────
-# Netlify removed: site is now on careers.annex-technologies.com
-ALLOWED_ORIGINS = [
+# ── CORS ─────────────────────────────────────────────────────────────────────
+# The production site plus local dev origins are always allowed. Extra origins
+# (a staging front-end, a preview URL) come from CORS_ORIGINS, comma-separated,
+# and any *.onrender.com origin is allowed so a Render-hosted front-end works
+# without a redeploy of the API. Admin routes stay protected by their tokens.
+DEFAULT_ORIGINS = [
     "https://careers.annex-technologies.com",
     "https://www.careers.annex-technologies.com",
     "http://localhost:3000",
@@ -60,11 +63,19 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:8080",
 ]
+EXTRA_ORIGINS = [o.strip().rstrip("/") for o in settings.CORS_ORIGINS.split(",") if o.strip()]
+ALLOWED_ORIGINS = DEFAULT_ORIGINS + [o for o in EXTRA_ORIGINS if o not in DEFAULT_ORIGINS]
+ALLOWED_ORIGIN_REGEX = settings.CORS_ORIGIN_REGEX or r"^https://[a-z0-9-]+\.onrender\.com$"
+
+
+def _origin_allowed(origin: str) -> bool:
+    return bool(origin) and (origin in ALLOWED_ORIGINS or re.match(ALLOWED_ORIGIN_REGEX, origin) is not None)
+
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    # ↓ Removed netlify allow_origin_regex — no longer needed
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
     allow_headers=["*"],
@@ -557,9 +568,10 @@ async def generic_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception on {request.url}: {exc}\n{traceback.format_exc()}")
     origin = request.headers.get("origin", "")
     headers = {}
-    if origin in ALLOWED_ORIGINS:
+    if _origin_allowed(origin):
         headers["Access-Control-Allow-Origin"] = origin
         headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Vary"] = "Origin"
     return JSONResponse(status_code=500, content={"detail": str(exc)}, headers=headers)
 
 

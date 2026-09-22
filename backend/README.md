@@ -208,6 +208,18 @@ GET  /api/admin/alerts/status   schedule, next run, last run summary
 POST /api/admin/alerts/run      run the pipeline now (background)
 ```
 
+## Front-end -> API wiring and CORS
+
+- The front-end reads `VITE_API_URL` at build time from the repo-root env files
+  (Vite `envDir` is the repo root): `.env` (local dev, `http://localhost:8000`)
+  and `.env.production` (`vite build`, the Render API). The code fallback is
+  also the Render API. Rebuild the front-end after changing it.
+- The API allows browser calls from the production site, localhost dev ports
+  and any `https://*.onrender.com` origin; add others with `CORS_ORIGINS`
+  (comma-separated). Preflight for the admin's `Authorization` header is
+  covered (`tests/test_cors.py`). Unhandled 500s also carry CORS headers so
+  the browser shows the real error instead of a CORS one.
+
 ## Monetisation: Featured Listings and Banner Ads
 
 Sold directly, paid outside the site (invoice / M-Pesa), switched on by the admin.

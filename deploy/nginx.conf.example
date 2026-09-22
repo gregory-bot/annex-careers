@@ -26,8 +26,8 @@ server {
 
     location ~ ^/__share/jobs/(\d+)$ {
         internal;
-        proxy_pass https://api.careers.annex-technologies.com/share/jobs/$1;
-        proxy_set_header Host api.careers.annex-technologies.com;
+        proxy_pass https://annex-careers.onrender.com/share/jobs/$1;
+        proxy_set_header Host annex-careers.onrender.com;
         proxy_ssl_server_name on;
     }
 

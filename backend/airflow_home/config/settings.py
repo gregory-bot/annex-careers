@@ -60,6 +60,10 @@ class Settings:
     # Only ONE running API instance should scrape and send alert emails. Set to "false" on
     # every extra instance (e.g. the old server while the new one is live) to avoid duplicates.
     SCHEDULER_ENABLED  = os.getenv("SCHEDULER_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+    # Extra browser origins allowed to call the API (comma-separated), e.g. a staging front-end.
+    CORS_ORIGINS       = os.getenv("CORS_ORIGINS", "")
+    # Optional regex for allowed origins; defaults to any https://*.onrender.com.
+    CORS_ORIGIN_REGEX  = os.getenv("CORS_ORIGIN_REGEX", "")
 
     # ── Admin auth ───────────────────────────────────────────────────────────
     ADMIN_USERNAME       = os.getenv("ADMIN_USERNAME", "")
