@@ -25,14 +25,14 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response, HTMLResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import func, desc, text, nullslast, select
+from sqlalchemy import func, desc, text, nullslast, select, case
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from airflow_home.database.connection import get_db, init_db, SessionLocal
 from airflow_home.database.models import (
-    Job, ScrapeLog, User, UserJobNotification, CVSubmission, AnalyticsEvent, JobSource, EmployerInvite, Attachment,
+    Job, ScrapeLog, User, UserJobNotification, CVSubmission, AnalyticsEvent, JobSource, EmployerInvite, Attachment, Ad,
 )
 from api import ocr
 from api.listing_extract import detect_content_type, extract_text as extract_attachment_text, parse_listing_text
@@ -113,6 +113,8 @@ class JobResponse(BaseModel):
     duration: Optional[str] = None
     budget: Optional[str] = None
     attachments: List[AttachmentResponse] = []
+    featured_until: Optional[datetime] = None
+    is_featured: bool = False
 
     class Config:
         orm_mode = True
@@ -159,6 +161,28 @@ class CreateJobRequest(BaseModel):
 class AdminLoginRequest(BaseModel):
     username: str
     password: str
+
+
+class FeatureRequest(BaseModel):
+    days: int = 7  # how long the listing stays pinned
+
+
+AD_PLACEMENTS = ("home", "jobs_list", "contracts_list", "job_sidebar")
+
+
+class AdRequest(BaseModel):
+    name: str
+    advertiser: Optional[str] = None
+    placement: Literal["home", "jobs_list", "contracts_list", "job_sidebar"]
+    headline: Optional[str] = None
+    link_url: str
+    image_url: Optional[str] = None
+    image_attachment_id: Optional[int] = None
+    starts_at: Optional[str] = None  # ISO date or datetime
+    ends_at: Optional[str] = None
+    is_active: bool = True
+    weight: int = 1
+    notes: Optional[str] = None
 
 
 class EmployerInviteRequest(BaseModel):
@@ -349,9 +373,10 @@ def _purge_orphan_attachments(older_than_hours: int = 24) -> int:
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=older_than_hours)
     db = SessionLocal()
     try:
+        creative_ids = select(Ad.image_attachment_id).where(Ad.image_attachment_id != None)
         removed = (
             db.query(Attachment)
-            .filter(Attachment.job_id == None, Attachment.created_at < cutoff)
+            .filter(Attachment.job_id == None, Attachment.created_at < cutoff, ~Attachment.id.in_(creative_ids))
             .delete(synchronize_session=False)
         )
         db.commit()
@@ -422,6 +447,8 @@ def startup():
                 "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS budget VARCHAR(120)",
                 "CREATE INDEX IF NOT EXISTS ix_jobs_kind ON jobs (kind)",
                 "ALTER TABLE job_sources ADD COLUMN IF NOT EXISTS kind VARCHAR(20) DEFAULT 'job'",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS featured_until TIMESTAMP",
+                "CREATE INDEX IF NOT EXISTS ix_jobs_featured_until ON jobs (featured_until)",
             ):
                 conn.execute(text(ddl))
             conn.execute(text("""
@@ -601,13 +628,17 @@ def list_jobs(
     job_type: Optional[str] = None,
     remote: Optional[bool] = None,
     kind: Literal["job", "contract", "all"] = Query("job"),
+    featured: Optional[bool] = None,
     sort_by: str = Query("scraped_at", pattern="^(scraped_at|posted_date|title|company|salary_min)$"),
     sort_order: str = Query("desc", pattern="^(asc|desc)$"),
     db: Session = Depends(get_db),
 ):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     query = _active_visible_jobs_query(db)
     if kind != "all":
         query = query.filter(Job.kind == kind)
+    if featured:
+        query = query.filter(Job.featured_until != None, Job.featured_until > now)
 
     if search:
         sf = f"%{search}%"
@@ -630,7 +661,9 @@ def list_jobs(
         # Postgres defaults NULLs to sort FIRST on DESC — push unknown
         # salaries to the bottom regardless of direction instead.
         ordering = nullslast(ordering)
-    query = query.order_by(ordering)
+    # Paid featured listings stay on top whatever the sort.
+    featured_rank = case((Job.featured_until > now, 1), else_=0)
+    query = query.order_by(desc(featured_rank), ordering)
 
     total = query.count()
     pages = math.ceil(total / per_page) if total > 0 else 1
@@ -810,6 +843,7 @@ def admin_list_jobs(
     search: Optional[str] = None,
     status: Literal["all", "active", "inactive"] = Query("all"),
     kind: Literal["all", "job", "contract"] = Query("all"),
+    featured: Optional[bool] = None,
     source: Optional[str] = None,
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
@@ -821,6 +855,9 @@ def admin_list_jobs(
     query = db.query(Job)
     if kind != "all":
         query = query.filter(Job.kind == kind)
+    if featured:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        query = query.filter(Job.featured_until != None, Job.featured_until > now)
     if status == "active":
         query = query.filter(Job.is_active == True)
     elif status == "inactive":
@@ -908,6 +945,34 @@ def admin_repost_job(job_id: int, db: Session = Depends(get_db), _admin=Depends(
         "job": JobResponse.from_orm(job),
         "deadline_cleared": deadline_cleared,
     }
+
+
+@app.post("/api/admin/jobs/{job_id}/feature")
+def admin_feature_job(job_id: int, req: FeatureRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    """Paid placement: pin the listing to the top of its list for N days."""
+    if not 1 <= req.days <= 365:
+        raise HTTPException(status_code=400, detail="Days must be between 1 and 365")
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    base = job.featured_until if job.featured_until and job.featured_until > now else now
+    job.featured_until = base + timedelta(days=req.days)
+    job.is_active = True
+    db.commit()
+    db.refresh(job)
+    logger.info(f"Admin featured job {job_id} until {job.featured_until}")
+    return {"message": f"Featured until {job.featured_until.strftime('%d %b %Y')}", "job": JobResponse.from_orm(job)}
+
+
+@app.delete("/api/admin/jobs/{job_id}/feature")
+def admin_unfeature_job(job_id: int, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job.featured_until = None
+    db.commit()
+    return {"message": "Listing is no longer featured", "job_id": job_id}
 
 
 @app.post("/api/admin/jobs/reclassify")
@@ -2526,6 +2591,7 @@ MAX_EXTRACTED_TEXT = 50_000
 @app.post("/api/uploads", status_code=201)
 async def upload_listing_file(
     file: UploadFile = File(...),
+    extract: bool = Query(True),
     uploader: str = Depends(require_uploader),
     db: Session = Depends(get_db),
 ):
@@ -2539,7 +2605,10 @@ async def upload_listing_file(
     if len(content) > MAX_ATTACHMENT_BYTES:
         raise HTTPException(status_code=413, detail=f"File is too large (max {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB)")
 
-    text, kind = extract_attachment_text(filename, content_type, content)
+    if extract:
+        text, kind = extract_attachment_text(filename, content_type, content)
+    else:
+        text, kind = "", ("image" if content_type.startswith("image/") else "document")
     attachment = Attachment(
         filename=filename, content_type=content_type, size=len(content), kind=kind,
         uploaded_by=uploader, extracted_text=(text or "")[:MAX_EXTRACTED_TEXT] or None, data=content,
@@ -2574,3 +2643,175 @@ def get_listing_file(attachment_id: int, download: bool = False, db: Session = D
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+# --- Banner ads (sold directly, managed from the admin) -----------------------
+
+AD_PLACEMENT_HINTS = {
+    "home": "Homepage, below the hero. Wide banner, about 1200 x 300 px.",
+    "jobs_list": "Jobs page, inside the results grid. Wide banner, about 1200 x 300 px.",
+    "contracts_list": "Contracts page, inside the results grid. Wide banner, about 1200 x 300 px.",
+    "job_sidebar": "Job and contract detail pages, under the Apply box. Tall or square, about 300 x 250 or 300 x 600 px.",
+}
+
+
+def _parse_schedule(value: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
+    if not value or not value.strip():
+        return None
+    text_value = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid date: {text_value}")
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    if end_of_day and len(text_value) == 10:
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    return parsed
+
+
+def _ad_status(ad: Ad, now: datetime) -> str:
+    if not ad.is_active:
+        return "paused"
+    if ad.starts_at and ad.starts_at > now:
+        return "scheduled"
+    if ad.ends_at and ad.ends_at < now:
+        return "expired"
+    return "active"
+
+
+def _ad_image(ad: Ad) -> Optional[str]:
+    if ad.image_attachment_id:
+        return f"/api/files/{ad.image_attachment_id}"
+    return ad.image_url or None
+
+
+def _ad_to_dict(ad: Ad) -> dict:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return {
+        "id": ad.id, "name": ad.name, "advertiser": ad.advertiser, "placement": ad.placement,
+        "headline": ad.headline, "link_url": ad.link_url, "image_url": ad.image_url,
+        "image_attachment_id": ad.image_attachment_id, "image": _ad_image(ad),
+        "starts_at": _iso_utc(ad.starts_at), "ends_at": _iso_utc(ad.ends_at),
+        "is_active": bool(ad.is_active), "weight": ad.weight, "status": _ad_status(ad, now),
+        "impressions": ad.impressions or 0, "clicks": ad.clicks or 0,
+        "ctr": round((ad.clicks or 0) / ad.impressions * 100, 2) if ad.impressions else 0.0,
+        "notes": ad.notes, "created_at": _iso_utc(ad.created_at), "updated_at": _iso_utc(ad.updated_at),
+    }
+
+
+def _apply_ad_request(db: Session, ad: Ad, req: AdRequest) -> None:
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Give the ad a name")
+    link = (req.link_url or "").strip()
+    if not re.match(r"^https?://[^\s]+$", link, re.I):
+        raise HTTPException(status_code=400, detail="The link must start with http:// or https://")
+    image_url = (req.image_url or "").strip() or None
+    if image_url and not re.match(r"^https?://[^\s]+$", image_url, re.I):
+        raise HTTPException(status_code=400, detail="The image URL must start with http:// or https://")
+    attachment_id = req.image_attachment_id
+    if attachment_id:
+        attachment = db.query(Attachment).filter(Attachment.id == attachment_id).first()
+        if not attachment or attachment.kind != "image":
+            raise HTTPException(status_code=400, detail="Uploaded creative not found or not an image")
+    if not image_url and not attachment_id:
+        raise HTTPException(status_code=400, detail="Upload a banner image or give an image URL")
+    if not 1 <= req.weight <= 10:
+        raise HTTPException(status_code=400, detail="Weight must be between 1 and 10")
+    starts_at = _parse_schedule(req.starts_at)
+    ends_at = _parse_schedule(req.ends_at, end_of_day=True)
+    if starts_at and ends_at and ends_at < starts_at:
+        raise HTTPException(status_code=400, detail="The end date is before the start date")
+
+    ad.name = name
+    ad.advertiser = (req.advertiser or "").strip() or None
+    ad.placement = req.placement
+    ad.headline = (req.headline or "").strip() or None
+    ad.link_url = link
+    ad.image_url = image_url
+    ad.image_attachment_id = attachment_id
+    ad.starts_at = starts_at
+    ad.ends_at = ends_at
+    ad.is_active = req.is_active
+    ad.weight = req.weight
+    ad.notes = (req.notes or "").strip() or None
+
+
+@app.get("/api/admin/ads")
+def admin_list_ads(db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    ads = db.query(Ad).order_by(desc(Ad.created_at), desc(Ad.id)).all()
+    return {"ads": [_ad_to_dict(a) for a in ads], "placements": AD_PLACEMENT_HINTS}
+
+
+@app.post("/api/admin/ads", status_code=201)
+def admin_create_ad(req: AdRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    ad = Ad()
+    _apply_ad_request(db, ad, req)
+    db.add(ad)
+    db.commit()
+    db.refresh(ad)
+    logger.info(f"Ad created: {ad.id} {ad.name} ({ad.placement})")
+    return _ad_to_dict(ad)
+
+
+@app.put("/api/admin/ads/{ad_id}")
+def admin_update_ad(ad_id: int, req: AdRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    ad = db.query(Ad).filter(Ad.id == ad_id).first()
+    if not ad:
+        raise HTTPException(status_code=404, detail="Ad not found")
+    old_attachment = ad.image_attachment_id
+    _apply_ad_request(db, ad, req)
+    if old_attachment and old_attachment != ad.image_attachment_id:
+        db.query(Attachment).filter(Attachment.id == old_attachment, Attachment.job_id == None).delete(synchronize_session=False)
+    db.commit()
+    db.refresh(ad)
+    return _ad_to_dict(ad)
+
+
+@app.delete("/api/admin/ads/{ad_id}")
+def admin_delete_ad(ad_id: int, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    ad = db.query(Ad).filter(Ad.id == ad_id).first()
+    if not ad:
+        raise HTTPException(status_code=404, detail="Ad not found")
+    creative = ad.image_attachment_id
+    db.delete(ad)
+    if creative:
+        db.query(Attachment).filter(Attachment.id == creative, Attachment.job_id == None).delete(synchronize_session=False)
+    db.commit()
+    return {"message": "Ad deleted", "id": ad_id}
+
+
+@app.get("/api/ads")
+def public_ads(placement: Literal["home", "jobs_list", "contracts_list", "job_sidebar"], db: Session = Depends(get_db)):
+    """Ads currently live in one placement. The client picks one by weight."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    ads = (
+        db.query(Ad)
+        .filter(Ad.placement == placement, Ad.is_active == True)
+        .filter((Ad.starts_at == None) | (Ad.starts_at <= now))
+        .filter((Ad.ends_at == None) | (Ad.ends_at >= now))
+        .order_by(desc(Ad.weight), Ad.id).all()
+    )
+    payload = {
+        "ads": [
+            {"id": a.id, "image": _ad_image(a), "link_url": a.link_url, "headline": a.headline,
+             "advertiser": a.advertiser, "weight": a.weight}
+            for a in ads if _ad_image(a)
+        ]
+    }
+    return Response(content=json.dumps(payload), media_type="application/json", headers={"Cache-Control": "public, max-age=60"})
+
+
+@app.post("/api/ads/{ad_id}/impression", status_code=204)
+def ad_impression(ad_id: int, db: Session = Depends(get_db)):
+    db.query(Ad).filter(Ad.id == ad_id).update({Ad.impressions: Ad.impressions + 1}, synchronize_session=False)
+    db.commit()
+    return Response(status_code=204)
+
+
+@app.post("/api/ads/{ad_id}/click", status_code=204)
+def ad_click(ad_id: int, db: Session = Depends(get_db)):
+    db.query(Ad).filter(Ad.id == ad_id).update({Ad.clicks: Ad.clicks + 1}, synchronize_session=False)
+    db.commit()
+    return Response(status_code=204)

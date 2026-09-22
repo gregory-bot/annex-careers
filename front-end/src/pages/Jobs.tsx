@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { useJobs, type ListingKind } from "../lib/jobStore";
 import { useSearchParams } from "react-router-dom";
 import { Search, ChevronDown, Loader2 } from "lucide-react";
@@ -6,6 +6,7 @@ import { motion } from "framer-motion";
 import Layout from "@/components/Layout";
 import { useDocumentMeta } from "@/lib/seo";
 import JobCard from "@/components/JobCard";
+import AdBanner from "@/components/AdBanner";
 
 const jobTypes = ["All", "Full-time", "Remote", "Contract", "Part-time", "Internship"];
 const locationFilters = ["All Locations", "Nairobi", "Mombasa", "Kisumu", "Eldoret", "Remote"];
@@ -183,14 +184,21 @@ const Jobs = ({ kind = "job" }: { kind?: ListingKind }) => {
               {/* Job grid */}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
                 {jobs.map((job, i) => (
-                  <motion.div
-                    key={job.id}
-                    initial={{ opacity: 0, y: 15 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: i * 0.03 }}
-                  >
-                    <JobCard job={job} />
-                  </motion.div>
+                  <Fragment key={job.id}>
+                    <motion.div
+                      initial={{ opacity: 0, y: 15 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: i * 0.03 }}
+                    >
+                      <JobCard job={job} />
+                    </motion.div>
+                    {/* One sponsored banner after the first row of results. */}
+                    {i === Math.min(2, jobs.length - 1) && (
+                      <div className="col-span-full">
+                        <AdBanner placement={isContract ? "contracts_list" : "jobs_list"} />
+                      </div>
+                    )}
+                  </Fragment>
                 ))}
               </div>
 

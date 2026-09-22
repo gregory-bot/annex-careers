@@ -208,6 +208,24 @@ GET  /api/admin/alerts/status   schedule, next run, last run summary
 POST /api/admin/alerts/run      run the pipeline now (background)
 ```
 
+## Monetisation: Featured Listings and Banner Ads
+
+Sold directly, paid outside the site (invoice / M-Pesa), switched on by the admin.
+
+- **Featured listings**: `POST /api/admin/jobs/{id}/feature` `{"days": 7}` sets
+  `jobs.featured_until`; `DELETE .../feature` clears it. Featured listings sort
+  first in every public list (whatever the sort) and carry `is_featured` /
+  `featured_until` in `JobResponse`; `GET /api/jobs?featured=true` filters.
+  Managed from the Dashboard table ("Feature..." / "Unfeature").
+- **Banner ads** (`ads` table, admin **Ads** tab): name, advertiser, placement
+  (`home`, `jobs_list`, `contracts_list`, `job_sidebar`), link, creative
+  (uploaded via `POST /api/uploads?extract=false` or an image URL), start /
+  end dates, active flag, weight. Public `GET /api/ads?placement=...` returns
+  the live ads; the `AdBanner` component picks one by weight, posts an
+  impression on mount and a click on the way out (`POST /api/ads/{id}/impression|click`).
+  Admin CRUD under `/api/admin/ads`, with status (active / scheduled / expired /
+  paused), impressions, clicks and CTR per ad.
+
 ## Listing Attachments (posters, TORs, contract documents)
 
 Admins and signed-in employers can attach files to a listing: poster images

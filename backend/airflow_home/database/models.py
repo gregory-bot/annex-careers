@@ -54,10 +54,17 @@ class Job(Base):
     # Poster images and TOR / contract documents uploaded with the listing.
     attachments = relationship("Attachment", order_by="Attachment.id", lazy="select",
                                cascade="all, delete-orphan", passive_deletes=True)
+    # Paid placement: pinned to the top of listings with a highlight until this time.
+    featured_until = Column(DateTime, nullable=True)
+
+    @property
+    def is_featured(self) -> bool:
+        return bool(self.featured_until and self.featured_until > datetime.datetime.utcnow())
 
     __table_args__ = (
         Index("ix_jobs_source", "source"),
         Index("ix_jobs_kind", "kind"),
+        Index("ix_jobs_featured_until", "featured_until"),
         Index("ix_jobs_title", "title"),
         Index("ix_jobs_company", "company"),
         Index("ix_jobs_location", "location"),
@@ -243,3 +250,35 @@ class Attachment(Base):
 
     def __repr__(self):
         return f"<Attachment(id={self.id}, job_id={self.job_id}, kind='{self.kind}', filename='{self.filename}')>"
+
+
+class Ad(Base):
+    """A banner sold directly to an advertiser and managed from the admin.
+    Shown in one placement while active and inside its schedule; impressions
+    and clicks are counted so performance can be reported back."""
+    __tablename__ = "ads"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(200), nullable=False)  # internal label, e.g. "Safaricom Sept campaign"
+    advertiser = Column(String(200), nullable=True)
+    placement = Column(String(40), nullable=False)  # 'home', 'jobs_list', 'contracts_list', 'job_sidebar'
+    headline = Column(String(200), nullable=True)  # alt text / caption
+    link_url = Column(String(1000), nullable=False)
+    image_url = Column(String(1000), nullable=True)  # external creative, or...
+    image_attachment_id = Column(Integer, ForeignKey("attachments.id", ondelete="SET NULL"), nullable=True)  # ...uploaded creative
+    starts_at = Column(DateTime, nullable=True)  # NULL = immediately
+    ends_at = Column(DateTime, nullable=True)  # NULL = until paused
+    is_active = Column(Boolean, nullable=False, default=True)
+    weight = Column(Integer, nullable=False, default=1)  # rotation share when several ads fill one placement
+    impressions = Column(Integer, nullable=False, default=0)
+    clicks = Column(Integer, nullable=False, default=0)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_ads_placement", "placement"),
+    )
+
+    def __repr__(self):
+        return f"<Ad(id={self.id}, name='{self.name}', placement='{self.placement}', active={self.is_active})>"

@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { MapPin, Clock, CalendarClock, Building2, DollarSign, FileText, Hourglass } from "lucide-react";
+import { MapPin, Clock, CalendarClock, Building2, DollarSign, FileText, Hourglass, Star } from "lucide-react";
 import { fileUrl, type Job } from "@/lib/jobStore";
 
 function formatDeadline(deadline: string): string {
@@ -46,7 +46,7 @@ const JobCard = ({ job }: { job: Job }) => {
   return (
     <Link
       to={`/jobs/${job.id}`}
-      className="bg-card border rounded-xl p-5 hover-lift group flex flex-col h-full cursor-pointer transition-shadow block"
+      className={`bg-card border rounded-xl p-5 hover-lift group flex flex-col h-full cursor-pointer transition-shadow block ${job.is_featured ? "border-primary/60 ring-2 ring-primary/30 bg-primary/[0.03]" : ""}`}
     >
       {/* Header: logo + badges */}
       <div className="flex items-start justify-between mb-4 gap-2">
@@ -58,6 +58,11 @@ const JobCard = ({ job }: { job: Job }) => {
           </div>
         )}
         <div className="flex flex-wrap gap-1 justify-end">
+          {job.is_featured && (
+            <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-primary text-primary-foreground inline-flex items-center gap-1">
+              <Star size={9} fill="currentColor" /> Featured
+            </span>
+          )}
           {isRemote && (
             <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">
               Remote

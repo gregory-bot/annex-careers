@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { ArrowLeft, MapPin, Briefcase, Clock, ExternalLink, Share2, CalendarClock, Building2, Loader2, FileCheck, FileText, Hourglass, Wallet } from "lucide-react";
 import Layout from "@/components/Layout";
 import JobCard from "@/components/JobCard";
+import AdBanner from "@/components/AdBanner";
 import { useJob, useAllJobs, trackAnalyticsEvent, fileUrl } from "@/lib/jobStore";
 import { useDocumentMeta, excerpt } from "@/lib/seo";
 import { toast } from "sonner";
@@ -334,6 +335,7 @@ const JobDetails = () => {
                   {job.location && <p><span className="font-medium text-foreground">Location:</span> {job.location}</p>}
                 </div>
               </div>
+              <div className="mt-4"><AdBanner placement="job_sidebar" variant="sidebar" /></div>
             </div>
           </div>
 

@@ -23,6 +23,9 @@ export interface Job {
   duration: string;
   budget: string;
   attachments: Attachment[];
+  /** Paid placement: pinned to the top of listings until this time. */
+  featured_until: string;
+  is_featured: boolean;
 }
 
 export type ListingKind = "job" | "contract";
@@ -149,6 +152,8 @@ function mapJob(j: any): Job {
     duration: j.duration ?? "",
     budget: j.budget ?? "",
     attachments: Array.isArray(j.attachments) ? j.attachments : [],
+    featured_until: j.featured_until ?? "",
+    is_featured: Boolean(j.is_featured),
   };
 }
 
@@ -166,6 +171,7 @@ export interface JobsQueryParams {
   remote?: boolean;
   /** Defaults to "job" on the server; pass "contract" for the Contracts page. */
   kind?: ListingKind | "all";
+  featured?: boolean;
   sortBy?: "scraped_at" | "posted_date" | "title" | "company" | "salary_min";
   sortOrder?: "asc" | "desc";
 }
@@ -191,6 +197,7 @@ async function fetchJobsPage(params: JobsQueryParams): Promise<JobsPage> {
   if (params.jobType) qs.set("job_type", params.jobType);
   if (params.remote !== undefined) qs.set("remote", String(params.remote));
   if (params.kind) qs.set("kind", params.kind);
+  if (params.featured) qs.set("featured", "true");
   if (params.sortBy) qs.set("sort_by", params.sortBy);
   if (params.sortOrder) qs.set("sort_order", params.sortOrder);
 
@@ -403,6 +410,118 @@ export function useSchedulerStatus() {
   return { running: query.data?.running ?? false, nextRun: query.data?.nextRun ?? null };
 }
 
+// --- Banner ads (sold directly, managed from the admin) ---
+
+export type AdPlacement = "home" | "jobs_list" | "contracts_list" | "job_sidebar";
+
+export interface PublicAd {
+  id: number;
+  image: string;
+  link_url: string;
+  headline: string | null;
+  advertiser: string | null;
+  weight: number;
+}
+
+/** Live ads for one placement; the banner component picks one by weight. */
+export function usePlacementAds(placement: AdPlacement) {
+  const query = useQuery({
+    queryKey: ["ads", placement],
+    queryFn: async (): Promise<PublicAd[]> => {
+      const res = await fetch(`${API_BASE}/api/ads?placement=${placement}`);
+      if (!res.ok) return [];
+      const data = await res.json();
+      return data.ads ?? [];
+    },
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+  return { ads: query.data ?? [], loading: query.isLoading };
+}
+
+function postAdEvent(id: number, event: "impression" | "click") {
+  return fetch(`${API_BASE}/api/ads/${id}/${event}`, { method: "POST", keepalive: true }).catch(() => undefined);
+}
+export const recordAdImpression = (id: number) => postAdEvent(id, "impression");
+export const recordAdClick = (id: number) => postAdEvent(id, "click");
+
+export interface Ad {
+  id: number;
+  name: string;
+  advertiser: string | null;
+  placement: AdPlacement;
+  headline: string | null;
+  link_url: string;
+  image_url: string | null;
+  image_attachment_id: number | null;
+  image: string | null;
+  starts_at: string | null;
+  ends_at: string | null;
+  is_active: boolean;
+  weight: number;
+  status: "active" | "paused" | "scheduled" | "expired";
+  impressions: number;
+  clicks: number;
+  ctr: number;
+  notes: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AdInput {
+  name: string;
+  advertiser?: string;
+  placement: AdPlacement;
+  headline?: string;
+  link_url: string;
+  image_url?: string;
+  image_attachment_id?: number | null;
+  starts_at?: string;
+  ends_at?: string;
+  is_active?: boolean;
+  weight?: number;
+  notes?: string;
+}
+
+export function useAdsAdmin() {
+  const query = useQuery({
+    queryKey: ["admin", "ads"],
+    queryFn: async (): Promise<{ ads: Ad[]; placements: Record<AdPlacement, string> }> => {
+      const res = await adminFetch("/api/admin/ads");
+      if (!res.ok) throw new Error(await readError(res, "Failed to load ads"));
+      return res.json();
+    },
+  });
+  return {
+    ads: query.data?.ads ?? [],
+    placements: query.data?.placements ?? ({} as Record<AdPlacement, string>),
+    loading: query.isLoading,
+    refresh: () => query.refetch(),
+  };
+}
+
+export async function createAd(input: AdInput): Promise<Ad> {
+  const res = await adminFetch("/api/admin/ads", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await readError(res, "Failed to create ad"));
+  return res.json();
+}
+
+export async function updateAd(id: number, input: AdInput): Promise<Ad> {
+  const res = await adminFetch(`/api/admin/ads/${id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await readError(res, "Failed to update ad"));
+  return res.json();
+}
+
+export async function deleteAd(id: number): Promise<{ message: string }> {
+  const res = await adminFetch(`/api/admin/ads/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(await readError(res, "Failed to delete ad"));
+  return res.json();
+}
+
 // --- Admin: automatic job-alert emails ---
 
 export interface AlertsStatus {
@@ -595,6 +714,7 @@ export interface AdminJobsParams {
   search?: string;
   status?: "all" | "active" | "inactive";
   kind?: "all" | ListingKind;
+  featured?: boolean;
   source?: string;
 }
 
@@ -610,6 +730,7 @@ export function useAdminJobs(params: AdminJobsParams = {}) {
       if (params.search) qs.set("search", params.search);
       if (params.status && params.status !== "all") qs.set("status", params.status);
       if (params.kind && params.kind !== "all") qs.set("kind", params.kind);
+      if (params.featured) qs.set("featured", "true");
       if (params.source) qs.set("source", params.source);
       const res = await adminFetch(`/api/admin/jobs?${qs.toString()}`);
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to load jobs");
@@ -635,6 +756,24 @@ export function useAdminJobs(params: AdminJobsParams = {}) {
 export async function deleteJob(id: string): Promise<{ message: string; job_id: number }> {
   const res = await adminFetch(`/api/admin/jobs/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to delete job");
+  return res.json();
+}
+
+/** Paid placement: pin a listing to the top of its list for `days` days (extends if already featured). */
+export async function featureJob(id: string, days: number): Promise<{ message: string; job: Job }> {
+  const res = await adminFetch(`/api/admin/jobs/${id}/feature`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ days }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to feature listing");
+  const body = await res.json();
+  return { message: body.message, job: mapJob(body.job) };
+}
+
+export async function unfeatureJob(id: string): Promise<{ message: string }> {
+  const res = await adminFetch(`/api/admin/jobs/${id}/feature`, { method: "DELETE" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to unfeature listing");
   return res.json();
 }
 
@@ -724,14 +863,16 @@ export interface UploadResult extends Attachment {
   }>;
 }
 
-/** Upload a poster image or TOR / contract document as the admin or as a signed-in employer. */
-export async function uploadListingFile(file: File, as: "admin" | "employer"): Promise<UploadResult> {
+/** Upload a poster image or TOR / contract document as the admin or as a signed-in employer.
+ * Pass `extract: false` for banner creatives, which don't need their text read. */
+export async function uploadListingFile(file: File, as: "admin" | "employer", options: { extract?: boolean } = {}): Promise<UploadResult> {
   const form = new FormData();
   form.append("file", file);
+  const path = options.extract === false ? "/api/uploads?extract=false" : "/api/uploads";
   // No Content-Type header: the browser must set the multipart boundary itself.
   const res = as === "admin"
-    ? await adminFetch("/api/uploads", { method: "POST", body: form })
-    : await employerFetch("/api/uploads", { method: "POST", body: form });
+    ? await adminFetch(path, { method: "POST", body: form })
+    : await employerFetch(path, { method: "POST", body: form });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Upload failed");
   return res.json();
 }

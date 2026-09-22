@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
-import { Loader2, LogOut, KeyRound, Briefcase, ExternalLink, CircleCheck, Repeat, Trash2, Eye, MousePointerClick } from "lucide-react";
+import { Loader2, LogOut, KeyRound, Briefcase, ExternalLink, CircleCheck, Repeat, Trash2, Eye, MousePointerClick, Star } from "lucide-react";
 import Layout from "@/components/Layout";
 import JobForm from "@/components/JobForm";
 import ConfirmDialog from "@/components/ConfirmDialog";
@@ -177,6 +177,7 @@ const EmployerPortal = () => {
                   <h2 className="font-heading font-semibold text-lg">Your postings ({me.jobs.length})</h2>
                   <p className="text-xs text-muted-foreground">
                     Views counts people who opened a job page. Apply clicks counts those who pressed Apply Now on it.
+                    Want a listing pinned to the top of the site? Ask us about featured placement.
                   </p>
                 </div>
               </div>
@@ -221,7 +222,16 @@ const EmployerPortal = () => {
                           const busy = actingId === job.id;
                           return (
                           <tr key={job.id} className={`border-b border-border last:border-0 ${busy ? "opacity-60" : ""}`}>
-                            <td className="px-4 py-3 font-medium">{job.title}</td>
+                            <td className="px-4 py-3 font-medium">
+                              <div className="flex items-center gap-2">
+                                {job.title}
+                                {job.is_featured && (
+                                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-primary text-primary-foreground" title={`Featured until ${new Date(job.featured_until).toLocaleDateString()}`}>
+                                    <Star size={9} fill="currentColor" /> Featured
+                                  </span>
+                                )}
+                              </div>
+                            </td>
                             <td className="px-4 py-3 hidden md:table-cell">
                               <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${job.kind === "contract" ? "bg-orange-100 text-orange-700" : "bg-blue-100 text-blue-700"}`}>
                                 {job.kind === "contract" ? "Contract" : "Job"}

@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
 import Layout from "@/components/Layout";
+import AdBanner from "@/components/AdBanner";
 import { useDocumentMeta } from "@/lib/seo";
 import Hero from "@/components/Hero";
 import JobCard from "@/components/JobCard";
@@ -55,6 +56,7 @@ const Index = () => {
   return (
     <Layout>
       <Hero />
+      <div className="container px-4 pt-8"><AdBanner placement="home" /></div>
 
       {/* Stats Cards — simple numbers, no icons */}
       <section className="container py-12 sm:py-16 px-4">

@@ -5,7 +5,7 @@ import {
   Loader2, Send, RefreshCw, Users, Menu, X, PlusCircle,
   Eye, MousePointerClick, Trash2, Repeat, ChevronLeft, ChevronRight,
   Globe, Play, Pencil, Power, ExternalLink, CalendarClock,
-  Building2, Copy, KeyRound, ShieldOff, ShieldCheck, Bell, FileText,
+  Building2, Copy, KeyRound, ShieldOff, ShieldCheck, Bell, FileText, Star, StarOff, Megaphone, Pause, PlayCircle,
 } from "lucide-react";
 import JobForm from "@/components/JobForm";
 import { toast } from "sonner";
@@ -16,15 +16,16 @@ import {
   useScrapeLogsAdmin, useUsersAdmin, useAdminAnalytics, useSchedulerStatus,
   useJobSourcesAdmin, createJobSource, updateJobSource, deleteJobSource, runSourceScrape,
   useEmployerInvitesAdmin, createEmployerInvite, resendEmployerInvite, updateEmployerInvite, deleteEmployerInvite,
-  useAlertsStatus, runAlertsNow, uploadListingFile,
+  useAlertsStatus, runAlertsNow, uploadListingFile, featureJob, unfeatureJob,
+  useAdsAdmin, createAd, updateAd, deleteAd,
   sendBulkAlerts, triggerScrapeAll, createJob, deleteJob, repostJob,
-  getAdminToken, clearAdminToken,
+  getAdminToken, clearAdminToken, fileUrl,
   type Job, type JobInput, type JobSource, type JobSourceInput, type SourceLastRun,
-  type EmployerInvite, type EmployerInviteIssued, type ListingKind,
+  type EmployerInvite, type EmployerInviteIssued, type ListingKind, type Ad, type AdInput, type AdPlacement,
 } from "@/lib/jobStore";
 import { isValidLocation } from "@/lib/locationUtils";
 
-type Tab = "dashboard" | "addjob" | "sources" | "employers" | "emails" | "logs";
+type Tab = "dashboard" | "addjob" | "sources" | "employers" | "ads" | "emails" | "logs";
 
 const inputClass =
   "w-full px-3 py-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary";
@@ -52,6 +53,7 @@ const AdminDashboard = () => {
     { id: "addjob", label: "Add Job", icon: <PlusCircle size={18} /> },
     { id: "sources", label: "Job Sources", icon: <Globe size={18} /> },
     { id: "employers", label: "Employers", icon: <Building2 size={18} /> },
+    { id: "ads", label: "Ads", icon: <Megaphone size={18} /> },
     { id: "emails", label: "Email Trigger", icon: <Mail size={18} /> },
     { id: "logs", label: "Scrape Logs", icon: <Activity size={18} /> },
   ];
@@ -101,6 +103,7 @@ const AdminDashboard = () => {
           {tab === "addjob" && <AddJobTab />}
           {tab === "sources" && <SourcesTab />}
           {tab === "employers" && <EmployersTab />}
+          {tab === "ads" && <AdsTab />}
           {tab === "emails" && <EmailTriggerTab />}
           {tab === "logs" && <ScrapeLogsTab />}
         </div>
@@ -170,7 +173,8 @@ function PaginationBar({ page, pages, total, perPage, onPageChange, busy = false
 // --- Dashboard ---
 
 const JOBS_PER_PAGE = 10;
-type StatusFilter = "all" | "active" | "inactive";
+type StatusFilter = "all" | "active" | "inactive" | "featured";
+const FEATURE_DURATIONS = [7, 14, 30];
 
 function DashboardTab() {
   const queryClient = useQueryClient();
@@ -193,7 +197,8 @@ function DashboardTab() {
     page,
     perPage: JOBS_PER_PAGE,
     search: debouncedSearch || undefined,
-    status: statusFilter,
+    status: statusFilter === "featured" ? "all" : statusFilter,
+    featured: statusFilter === "featured" || undefined,
     kind: kindFilter,
   });
 
@@ -217,6 +222,32 @@ function DashboardTab() {
       invalidateJobData();
     } catch (err) {
       toast.error(errorMessage(err, "Failed to repost job"));
+    } finally {
+      setActingId(null);
+    }
+  };
+
+  const handleFeature = async (job: Job, days: number) => {
+    setActingId(job.id);
+    try {
+      const result = await featureJob(job.id, days);
+      toast.success(`"${job.title}": ${result.message.toLowerCase()}`);
+      invalidateJobData();
+    } catch (err) {
+      toast.error(errorMessage(err, "Failed to feature listing"));
+    } finally {
+      setActingId(null);
+    }
+  };
+
+  const handleUnfeature = async (job: Job) => {
+    setActingId(job.id);
+    try {
+      await unfeatureJob(job.id);
+      toast.success(`"${job.title}" is no longer featured`);
+      invalidateJobData();
+    } catch (err) {
+      toast.error(errorMessage(err, "Failed to unfeature listing"));
     } finally {
       setActingId(null);
     }
@@ -343,6 +374,7 @@ function DashboardTab() {
             <option value="all">All statuses</option>
             <option value="active">Active only</option>
             <option value="inactive">Inactive only</option>
+            <option value="featured">Featured only</option>
           </select>
         </div>
       </div>
@@ -375,6 +407,11 @@ function DashboardTab() {
                           {job.kind === "contract" && (
                             <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-orange-100 text-orange-700"><FileText size={9} /> Contract</span>
                           )}
+                          {job.is_featured && (
+                            <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-primary text-primary-foreground" title={`Featured until ${formatDate(job.featured_until)}`}>
+                              <Star size={9} fill="currentColor" /> Featured
+                            </span>
+                          )}
                         </div>
                         <div className="text-xs text-muted-foreground sm:hidden">{job.company || "—"} · {job.location || "—"}</div>
                       </td>
@@ -393,6 +430,28 @@ function DashboardTab() {
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex items-center justify-end gap-1">
+                          {job.is_featured ? (
+                            <button
+                              onClick={() => handleUnfeature(job)}
+                              disabled={actingId !== null}
+                              title={`Featured until ${formatDate(job.featured_until)}. Click to remove.`}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                            >
+                              <StarOff size={14} /><span className="hidden sm:inline">Unfeature</span>
+                            </button>
+                          ) : (
+                            <select
+                              value=""
+                              onChange={(e) => { const days = Number(e.target.value); if (days) handleFeature(job, days); }}
+                              disabled={actingId !== null}
+                              title="Paid placement: pin to the top of the list"
+                              className="text-xs font-medium text-amber-700 bg-transparent hover:bg-amber-50 rounded-lg px-2 py-1.5 border border-transparent focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50"
+                              aria-label={`Feature ${job.title}`}
+                            >
+                              <option value="">Feature{"\u2026"}</option>
+                              {FEATURE_DURATIONS.map((d) => <option key={d} value={d}>{d} days</option>)}
+                            </select>
+                          )}
                           <button
                             onClick={() => handleRepost(job)}
                             disabled={actingId !== null}
@@ -856,6 +915,334 @@ function EmployersTab() {
         confirmLabel="Delete"
         onConfirm={handleDelete}
         description={pendingDelete ? `${pendingDelete.company_name} will no longer be able to sign in. Jobs they already posted stay live.` : null}
+      />
+    </>
+  );
+}
+
+// --- Ads (banners sold directly to advertisers) ---
+
+const EMPTY_AD_FORM = {
+  name: "", advertiser: "", placement: "jobs_list" as AdPlacement, headline: "", link_url: "",
+  image_url: "", image_attachment_id: null as number | null, image_preview: "",
+  starts_at: "", ends_at: "", weight: "1", is_active: true, notes: "",
+};
+type AdFormState = typeof EMPTY_AD_FORM;
+
+function adToForm(ad: Ad): AdFormState {
+  return {
+    name: ad.name, advertiser: ad.advertiser ?? "", placement: ad.placement, headline: ad.headline ?? "",
+    link_url: ad.link_url, image_url: ad.image_url ?? "", image_attachment_id: ad.image_attachment_id,
+    image_preview: ad.image ?? "", starts_at: ad.starts_at ? ad.starts_at.slice(0, 10) : "",
+    ends_at: ad.ends_at ? ad.ends_at.slice(0, 10) : "", weight: String(ad.weight), is_active: ad.is_active, notes: ad.notes ?? "",
+  };
+}
+
+function adToInput(ad: Ad, overrides: Partial<AdInput> = {}): AdInput {
+  return {
+    name: ad.name, advertiser: ad.advertiser ?? undefined, placement: ad.placement, headline: ad.headline ?? undefined,
+    link_url: ad.link_url, image_url: ad.image_url ?? undefined, image_attachment_id: ad.image_attachment_id,
+    starts_at: ad.starts_at ?? undefined, ends_at: ad.ends_at ?? undefined, weight: ad.weight, notes: ad.notes ?? undefined,
+    is_active: ad.is_active, ...overrides,
+  };
+}
+
+function AdForm({ initial, placements, onSaved, onCancel }: {
+  initial: Ad | null;
+  placements: Record<AdPlacement, string>;
+  onSaved: () => void;
+  onCancel: () => void;
+}) {
+  const [form, setForm] = useState<AdFormState>(initial ? adToForm(initial) : EMPTY_AD_FORM);
+  const [saving, setSaving] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const update = (field: keyof AdFormState, value: string | boolean | number | null) => setForm((prev) => ({ ...prev, [field]: value }));
+
+  const handleCreative = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const file = files[0];
+    if (!file.type.startsWith("image/")) return toast.error("The banner must be an image (JPG, PNG or WEBP)");
+    setUploading(true);
+    try {
+      const result = await uploadListingFile(file, "admin", { extract: false });
+      setForm((prev) => ({ ...prev, image_attachment_id: result.id, image_preview: result.url, image_url: "" }));
+      toast.success(`Uploaded ${file.name}`);
+    } catch (err) {
+      toast.error(errorMessage(err, "Upload failed"));
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!form.name.trim()) return toast.error("Give the ad a name");
+    if (!/^https?:\/\//i.test(form.link_url.trim())) return toast.error("The link must start with http:// or https://");
+    if (!form.image_attachment_id && !form.image_url.trim()) return toast.error("Upload a banner image or paste an image URL");
+    setSaving(true);
+    try {
+      const payload: AdInput = {
+        name: form.name.trim(), advertiser: form.advertiser.trim() || undefined, placement: form.placement,
+        headline: form.headline.trim() || undefined, link_url: form.link_url.trim(),
+        image_url: form.image_url.trim() || undefined, image_attachment_id: form.image_attachment_id,
+        starts_at: form.starts_at || undefined, ends_at: form.ends_at || undefined,
+        weight: Math.min(10, Math.max(1, Number(form.weight) || 1)), is_active: form.is_active, notes: form.notes.trim() || undefined,
+      };
+      const saved = initial ? await updateAd(initial.id, payload) : await createAd(payload);
+      toast.success(initial ? `Updated ${saved.name}` : `${saved.name} is ${saved.status}`);
+      onSaved();
+    } catch (err) {
+      toast.error(errorMessage(err, "Failed to save ad"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const preview = form.image_preview || form.image_url;
+
+  return (
+    <form onSubmit={handleSubmit} className="bg-card border border-primary/40 rounded-xl p-4 sm:p-6 mb-6">
+      <div className="flex items-start justify-between gap-3 mb-4">
+        <div>
+          <h3 className="font-heading font-semibold">{initial ? `Edit ${initial.name}` : "New banner ad"}</h3>
+          <p className="text-xs text-muted-foreground">Sold directly to the advertiser. It shows in one placement while active and inside its dates; impressions and clicks are counted for you.</p>
+        </div>
+        <button type="button" onClick={onCancel} className="p-1.5 rounded-lg hover:bg-muted" aria-label="Close form"><X size={16} /></button>
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium mb-1">Internal name *</label>
+              <input type="text" value={form.name} onChange={(e) => update("name", e.target.value)} placeholder="e.g. Safaricom Sept campaign" className={inputClass} />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Advertiser</label>
+              <input type="text" value={form.advertiser} onChange={(e) => update("advertiser", e.target.value)} placeholder="e.g. Safaricom PLC" className={inputClass} />
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Placement *</label>
+            <select value={form.placement} onChange={(e) => update("placement", e.target.value as AdPlacement)} className={inputClass}>
+              <option value="home">Homepage banner</option>
+              <option value="jobs_list">Jobs list</option>
+              <option value="contracts_list">Contracts list</option>
+              <option value="job_sidebar">Job / contract page sidebar</option>
+            </select>
+            <p className="text-xs text-muted-foreground mt-1">{placements[form.placement] ?? ""}</p>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Click-through link *</label>
+            <input type="url" value={form.link_url} onChange={(e) => update("link_url", e.target.value)} placeholder="https://advertiser.com/landing-page" className={inputClass} />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Headline / alt text</label>
+            <input type="text" value={form.headline} onChange={(e) => update("headline", e.target.value)} placeholder="Shown on hover and to screen readers" className={inputClass} />
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div>
+              <label className="block text-sm font-medium mb-1">Starts</label>
+              <input type="date" value={form.starts_at} onChange={(e) => update("starts_at", e.target.value)} className={inputClass} />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Ends</label>
+              <input type="date" value={form.ends_at} onChange={(e) => update("ends_at", e.target.value)} className={inputClass} />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Weight (1-10)</label>
+              <input type="number" min={1} max={10} value={form.weight} onChange={(e) => update("weight", e.target.value)} className={inputClass} />
+            </div>
+          </div>
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input type="checkbox" checked={form.is_active} onChange={(e) => update("is_active", e.target.checked)} className="rounded" />
+            Active (uncheck to pause without deleting)
+          </label>
+        </div>
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-1">Banner image *</label>
+            <div className="rounded-lg border border-dashed border-border bg-muted/40 p-3">
+              {preview ? (
+                <img src={fileUrl(preview)} alt="Banner preview" className="w-full max-h-48 object-contain rounded-md bg-card border border-border mb-3" />
+              ) : (
+                <p className="text-xs text-muted-foreground mb-3">No image yet. Upload the advertiser's creative or paste a hosted image URL below.</p>
+              )}
+              <label className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-input bg-card text-sm font-medium hover:bg-muted cursor-pointer">
+                {uploading ? <Loader2 size={15} className="animate-spin" /> : <PlusCircle size={15} />}
+                {uploading ? "Uploading..." : form.image_attachment_id ? "Replace image" : "Upload image"}
+                <input type="file" accept="image/jpeg,image/png,image/webp" className="hidden" onChange={(e) => handleCreative(e.target.files)} />
+              </label>
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">or image URL</label>
+            <input type="url" value={form.image_url} onChange={(e) => setForm((prev) => ({ ...prev, image_url: e.target.value, image_attachment_id: e.target.value ? null : prev.image_attachment_id, image_preview: e.target.value ? "" : prev.image_preview }))} placeholder="https://cdn.advertiser.com/banner.jpg" className={inputClass} />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Notes (price, contact, invoice)</label>
+            <textarea value={form.notes} onChange={(e) => update("notes", e.target.value)} rows={3} placeholder="e.g. KES 15,000 for 30 days, paid via M-Pesa 22 Sep" className={`${inputClass} resize-y`} />
+          </div>
+        </div>
+      </div>
+      <div className="flex items-center justify-end gap-2 mt-6 pt-4 border-t border-border">
+        <button type="button" onClick={onCancel} className="px-4 py-2 rounded-lg text-sm font-medium bg-muted hover:bg-muted/80">Cancel</button>
+        <button type="submit" disabled={saving || uploading} className="flex items-center gap-2 px-5 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50">
+          {saving ? <Loader2 size={16} className="animate-spin" /> : <Megaphone size={16} />}
+          {saving ? "Saving..." : initial ? "Save changes" : "Create ad"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function AdStatusBadge({ status }: { status: Ad["status"] }) {
+  const cls = status === "active" ? "bg-green-100 text-green-700" : status === "scheduled" ? "bg-blue-100 text-blue-700"
+    : status === "expired" ? "bg-gray-100 text-gray-600" : "bg-amber-100 text-amber-700";
+  return <span className={`px-2 py-0.5 rounded-full text-xs font-medium capitalize ${cls}`}>{status}</span>;
+}
+
+function AdsTab() {
+  const queryClient = useQueryClient();
+  const { ads, placements, loading, refresh } = useAdsAdmin();
+  const [editing, setEditing] = useState<Ad | "new" | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Ad | null>(null);
+  const [actingId, setActingId] = useState<number | null>(null);
+
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ["admin", "ads"] });
+    queryClient.invalidateQueries({ queryKey: ["ads"] });
+  };
+
+  const togglePause = async (ad: Ad) => {
+    setActingId(ad.id);
+    try {
+      await updateAd(ad.id, adToInput(ad, { is_active: !ad.is_active }));
+      toast.success(ad.is_active ? `${ad.name} paused` : `${ad.name} resumed`);
+      invalidate();
+    } catch (err) {
+      toast.error(errorMessage(err, "Failed to update ad"));
+    } finally {
+      setActingId(null);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!pendingDelete) return;
+    const ad = pendingDelete;
+    setPendingDelete(null);
+    setActingId(ad.id);
+    try {
+      await deleteAd(ad.id);
+      toast.success(`Deleted ${ad.name}`);
+      invalidate();
+    } catch (err) {
+      toast.error(errorMessage(err, "Failed to delete ad"));
+    } finally {
+      setActingId(null);
+    }
+  };
+
+  const totals = ads.reduce(
+    (acc, ad) => ({ impressions: acc.impressions + ad.impressions, clicks: acc.clicks + ad.clicks, live: acc.live + (ad.status === "active" ? 1 : 0) }),
+    { impressions: 0, clicks: 0, live: 0 },
+  );
+
+  return (
+    <>
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-6">
+        <div>
+          <h2 className="font-heading font-bold text-lg">Ads</h2>
+          <p className="text-sm text-muted-foreground">Banner placements you sell directly to advertisers. Payment is handled outside the site; switch the ad on once it is paid. Featured listings are managed from the Dashboard table.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => refresh()} className="p-2 rounded-lg border border-input hover:bg-muted" title="Refresh"><RefreshCw size={16} /></button>
+          <button onClick={() => setEditing("new")} disabled={editing === "new"} className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50">
+            <PlusCircle size={16} /> New ad
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-3 mb-6">
+        <StatCard label="Live ads" value={totals.live} />
+        <StatCard label="Impressions" value={totals.impressions} />
+        <StatCard label="Clicks" value={totals.clicks} />
+      </div>
+
+      {editing !== null && (
+        <AdForm key={editing === "new" ? "new" : editing.id} initial={editing === "new" ? null : editing} placements={placements} onSaved={() => { setEditing(null); invalidate(); }} onCancel={() => setEditing(null)} />
+      )}
+
+      {loading ? (
+        <div className="text-center py-12"><Loader2 className="w-6 h-6 animate-spin text-primary mx-auto" /></div>
+      ) : ads.length === 0 ? (
+        <div className="bg-card border border-dashed border-border rounded-xl text-center py-10 text-muted-foreground">
+          <Megaphone size={32} className="mx-auto mb-3 opacity-40" />
+          <p className="text-sm">No ads yet.</p>
+          <p className="text-xs mt-1">Create one with the advertiser's banner, a link and a placement.</p>
+        </div>
+      ) : (
+        <div className="bg-card border border-border rounded-xl overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border text-left">
+                  <th className="px-4 py-3 font-medium text-muted-foreground">Ad</th>
+                  <th className="px-4 py-3 font-medium text-muted-foreground hidden md:table-cell">Placement</th>
+                  <th className="px-4 py-3 font-medium text-muted-foreground hidden lg:table-cell">Schedule</th>
+                  <th className="px-4 py-3 font-medium text-muted-foreground">Status</th>
+                  <th className="px-4 py-3 font-medium text-muted-foreground text-right hidden sm:table-cell">Impressions</th>
+                  <th className="px-4 py-3 font-medium text-muted-foreground text-right">Clicks</th>
+                  <th className="px-4 py-3 font-medium text-muted-foreground text-right hidden sm:table-cell">CTR</th>
+                  <th className="px-4 py-3 font-medium text-muted-foreground text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ads.map((ad) => {
+                  const busy = actingId === ad.id;
+                  return (
+                    <tr key={ad.id} className={`border-b border-border last:border-0 hover:bg-muted/50 ${busy ? "opacity-60" : ""}`}>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-3 min-w-0">
+                          {ad.image ? <img src={fileUrl(ad.image)} alt="" className="w-16 h-10 object-cover rounded border border-border shrink-0" /> : <div className="w-16 h-10 rounded bg-muted shrink-0" />}
+                          <div className="min-w-0">
+                            <div className="font-medium truncate">{ad.name}</div>
+                            <div className="text-xs text-muted-foreground truncate">{ad.advertiser || "\u2014"} {"\u00b7"} <a href={ad.link_url} target="_blank" rel="noreferrer" className="text-primary hover:underline">link</a></div>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 hidden md:table-cell text-muted-foreground text-xs">{ad.placement.replace("_", " ")}</td>
+                      <td className="px-4 py-3 hidden lg:table-cell text-xs text-muted-foreground whitespace-nowrap">
+                        {ad.starts_at ? formatDate(ad.starts_at) : "now"} {"\u2192"} {ad.ends_at ? formatDate(ad.ends_at) : "until paused"}
+                      </td>
+                      <td className="px-4 py-3"><AdStatusBadge status={ad.status} /></td>
+                      <td className="px-4 py-3 text-right tabular-nums hidden sm:table-cell">{ad.impressions.toLocaleString()}</td>
+                      <td className="px-4 py-3 text-right tabular-nums font-semibold">{ad.clicks.toLocaleString()}</td>
+                      <td className="px-4 py-3 text-right tabular-nums hidden sm:table-cell">{ad.ctr}%</td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center justify-end gap-1 flex-wrap">
+                          <button onClick={() => setEditing(ad)} disabled={busy} className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium hover:bg-muted disabled:opacity-50"><Pencil size={14} /><span className="hidden sm:inline">Edit</span></button>
+                          <button onClick={() => togglePause(ad)} disabled={busy} className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium hover:bg-muted disabled:opacity-50">
+                            {ad.is_active ? <Pause size={14} /> : <PlayCircle size={14} />}<span className="hidden sm:inline">{ad.is_active ? "Pause" : "Resume"}</span>
+                          </button>
+                          <button onClick={() => setPendingDelete(ad)} disabled={busy} className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"><Trash2 size={14} /><span className="hidden sm:inline">Delete</span></button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        onOpenChange={(open) => { if (!open) setPendingDelete(null); }}
+        title="Delete this ad?"
+        confirmLabel="Delete"
+        onConfirm={handleDelete}
+        description={pendingDelete ? `${pendingDelete.name} and its impression and click counts will be removed. Use Pause if you only want to stop showing it.` : null}
       />
     </>
   );
