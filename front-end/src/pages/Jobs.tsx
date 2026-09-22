@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { useJobs } from "../lib/jobStore";
+import { useJobs, type ListingKind } from "../lib/jobStore";
 import { useSearchParams } from "react-router-dom";
 import { Search, ChevronDown, Loader2 } from "lucide-react";
 import { motion } from "framer-motion";
 import Layout from "@/components/Layout";
+import { useDocumentMeta } from "@/lib/seo";
 import JobCard from "@/components/JobCard";
 
 const jobTypes = ["All", "Full-time", "Remote", "Contract", "Part-time", "Internship"];
@@ -23,7 +24,13 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
   return debounced;
 }
 
-const Jobs = () => {
+/** Listing page for jobs (/jobs) and contracts / consultancies (/contracts). */
+const Jobs = ({ kind = "job" }: { kind?: ListingKind }) => {
+  const isContract = kind === "contract";
+  const noun = isContract ? "contracts" : "jobs";
+  useDocumentMeta(isContract
+    ? { title: "Contracts & Consultancies in Kenya", description: "Consultancy assignments, terms of reference and tenders from government, UN agencies, NGOs and companies in Kenya." }
+    : { title: "Browse Jobs in Kenya", description: "Search hundreds of verified job openings across Kenya by title, company, location and type. Direct apply links." });
   const [searchParams, setSearchParams] = useSearchParams();
   const initialQuery = searchParams.get("q") || "";
   const initialCat = searchParams.get("cat") || "";
@@ -62,9 +69,10 @@ const Jobs = () => {
     page,
     perPage: PER_PAGE,
     search: debouncedSearch || undefined,
-    jobType,
+    jobType: isContract ? undefined : jobType,
     remote,
     location,
+    kind,
     sortBy: sortBy_,
     sortOrder,
   });
@@ -78,13 +86,18 @@ const Jobs = () => {
         {/* Search */}
         <div className="bg-muted border-b border-border">
           <div className="container py-6 sm:py-8 px-4">
-            <h1 className="font-heading text-2xl sm:text-3xl font-bold mb-4 sm:mb-6">Browse Jobs</h1>
+            <h1 className="font-heading text-2xl sm:text-3xl font-bold mb-2">{isContract ? "Contracts & Consultancies" : "Browse Jobs"}</h1>
+            {isContract && (
+              <p className="text-sm text-muted-foreground mb-4 sm:mb-6">
+                Short-term assignments, consultancies and tenders with their terms of reference, from government, UN agencies, NGOs and companies.
+              </p>
+            )}
             <div className="flex bg-background rounded-xl border border-border overflow-hidden">
               <div className="flex items-center flex-1 px-3 sm:px-4 gap-2 sm:gap-3 min-w-0">
                 <Search className="text-muted-foreground w-4 h-4 sm:w-5 sm:h-5 shrink-0" />
                 <input
                   type="text"
-                  placeholder="Search by title, company..."
+                  placeholder={isContract ? "Search by title, organization..." : "Search by title, company..."}
                   value={searchInput}
                   onChange={(e) => setSearchInput(e.target.value)}
                   className="flex-1 py-3 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none text-sm min-w-0"
@@ -99,7 +112,7 @@ const Jobs = () => {
 
         {/* Filters */}
         <div className="container py-4 sm:py-6 px-4">
-          <div className="flex flex-wrap gap-2 mb-4 sm:mb-6">
+          <div className={`flex flex-wrap gap-2 mb-4 sm:mb-6 ${isContract ? "hidden" : ""}`}>
             {jobTypes.map((type) => (
               <button
                 key={type}
@@ -159,12 +172,12 @@ const Jobs = () => {
           {isLoading && jobs.length === 0 ? (
             <div className="text-center py-16">
               <Loader2 className="w-8 h-8 animate-spin text-primary mx-auto mb-3" />
-              <p className="text-sm text-muted-foreground">Loading jobs...</p>
+              <p className="text-sm text-muted-foreground">Loading {noun}...</p>
             </div>
           ) : (
             <>
               <p className="text-sm text-muted-foreground mb-4 sm:mb-6">
-                Showing {jobs.length} of {total} jobs
+                Showing {jobs.length} of {total} {noun}
               </p>
 
               {/* Job grid */}
@@ -183,7 +196,9 @@ const Jobs = () => {
 
               {jobs.length === 0 && (
                 <p className="text-center text-sm text-muted-foreground py-12">
-                  No jobs match your filters.
+                  {isContract && !debouncedSearch && total === 0
+                    ? "No contracts published yet. Consultancies and tenders appear here as they are collected or posted."
+                    : `No ${noun} match your filters.`}
                 </p>
               )}
 

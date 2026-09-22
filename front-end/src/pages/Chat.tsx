@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { Send, Loader2, Plus, FileText, Sparkles, X, Trash2, Download, TrendingUp, TrendingDown, Lightbulb, CheckCircle } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import Layout from "@/components/Layout";
+import { useDocumentMeta } from "@/lib/seo";
 import { useJob, type Job, type CvAnalysisResult, analyzeCv, generateAtsCv } from "@/lib/jobStore";
 
 interface Message {
@@ -201,6 +202,7 @@ const ACCEPTED_TYPES = ".pdf,.docx,.txt";
 
 // ── Component ────────────────────────────────────────
 const Chat = () => {
+  useDocumentMeta({ title: "CV Check", description: "Upload your CV to see how well it matches a job and get an ATS-friendly version." });
   const [searchParams] = useSearchParams();
   const jobId = searchParams.get("jobId");
   const { job: targetJob } = useJob(jobId ?? undefined);

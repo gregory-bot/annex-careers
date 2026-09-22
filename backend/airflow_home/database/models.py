@@ -41,9 +41,17 @@ class Job(Base):
     application_deadline = Column(DateTime, nullable=True)
     scraped_at = Column(DateTime, default=datetime.datetime.utcnow)
     is_active = Column(Boolean, default=True)
+    # Set when a company posted the job through the employer portal.
+    employer_invite_id = Column(Integer, nullable=True)
+    # "job" (default) or "contract": consultancies, TOR-based assignments, tenders.
+    kind = Column(String(20), nullable=False, default="job", server_default="job")
+    tor_url = Column(String(1000), nullable=True)  # Terms of Reference / tender document
+    duration = Column(String(120), nullable=True)  # e.g. "3 months", "20 working days"
+    budget = Column(String(120), nullable=True)  # e.g. "KES 800,000", "USD 15,000 fixed fee"
 
     __table_args__ = (
         Index("ix_jobs_source", "source"),
+        Index("ix_jobs_kind", "kind"),
         Index("ix_jobs_title", "title"),
         Index("ix_jobs_company", "company"),
         Index("ix_jobs_location", "location"),
@@ -146,3 +154,56 @@ class AnalyticsEvent(Base):
         Index("ix_analytics_events_type_created", "event_type", "created_at"),
         Index("ix_analytics_events_job_type", "job_id", "event_type"),
     )
+
+
+class JobSource(Base):
+    """An admin-added job board or careers page. Scraped by the generic
+    site scraper alongside the hard-coded scrapers in SCRAPER_REGISTRY, so
+    new sources can be added from the admin UI without a code change."""
+    __tablename__ = "job_sources"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(200), nullable=False)
+    slug = Column(String(100), nullable=False, unique=True)  # becomes Job.source
+    urls = Column(Text, nullable=False)  # one listing-page URL per line
+    link_pattern = Column(String(500), nullable=True)  # regex a job link must match
+    link_selector = Column(String(500), nullable=True)  # CSS selector for job links
+    description_selector = Column(String(500), nullable=True)  # CSS selector on job pages
+    default_company = Column(String(300), nullable=True)  # for single-company careers pages
+    default_location = Column(String(300), nullable=True)
+    max_jobs = Column(Integer, default=60)
+    enabled = Column(Boolean, default=True)
+    # What this source lists: "job" or "contract" (consultancies, TORs, tenders).
+    kind = Column(String(20), nullable=False, default="job", server_default="job")
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    def __repr__(self):
+        return f"<JobSource(slug='{self.slug}', kind='{self.kind}', enabled={self.enabled})>"
+
+
+class EmployerInvite(Base):
+    """A company invited to post jobs through the employer portal. The admin
+    creates the invite; the company receives the portal link and a unique
+    access code by email. Only the code's hash is stored."""
+    __tablename__ = "employer_invites"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    company_name = Column(String(300), nullable=False)
+    contact_name = Column(String(200), nullable=True)
+    email = Column(String(320), nullable=False)
+    access_code_hash = Column(String(64), nullable=False)
+    status = Column(String(20), nullable=False, default="active")  # 'active' or 'revoked'
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)  # NULL = no expiry
+    email_sent_at = Column(DateTime, nullable=True)
+    last_login_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_employer_invites_email", "email"),
+    )
+
+    def __repr__(self):
+        return f"<EmployerInvite(company='{self.company_name}', email='{self.email}', status='{self.status}')>"

@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
 import { Loader2 } from "lucide-react";
 import Layout from "@/components/Layout";
+import { useDocumentMeta } from "@/lib/seo";
 import { useCategories, useStats } from "@/lib/jobStore";
 
 /** Capitalize a tag/category nicely */
@@ -17,6 +18,7 @@ function formatTag(tag: string): string {
 }
 
 const Categories = () => {
+  useDocumentMeta({ title: "Jobs by Category", description: "Browse jobs in Kenya by field: IT, finance, marketing, healthcare, engineering and more." });
   const { categories, isLoading: categoriesLoading } = useCategories();
   const { stats, loading: statsLoading } = useStats();
   const loading = categoriesLoading || statsLoading;

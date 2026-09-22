@@ -3,9 +3,11 @@ import { Link } from "react-router-dom";
 import { Search, Loader2 } from "lucide-react";
 import { motion } from "framer-motion";
 import Layout from "@/components/Layout";
+import { useDocumentMeta } from "@/lib/seo";
 import { useCompanies } from "@/lib/jobStore";
 
 const Companies = () => {
+  useDocumentMeta({ title: "Companies Hiring in Kenya", description: "Explore companies currently hiring in Kenya and browse their open roles." });
   const [search, setSearch] = useState("");
   const { companies, isLoading: loading } = useCompanies();
 

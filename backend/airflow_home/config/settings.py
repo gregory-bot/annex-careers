@@ -51,6 +51,10 @@ class Settings:
     )
     SCRAPE_INTERVAL_HOURS = int(os.getenv("SCRAPE_INTERVAL_HOURS", "24"))
 
+    # ── Automatic emails / integrations ─────────────────────────────────────
+    JOB_ALERT_HOUR_UTC = int(os.getenv("JOB_ALERT_HOUR_UTC", "5"))  # 05:00 UTC = 08:00 EAT
+    RELIEFWEB_APPNAME  = os.getenv("RELIEFWEB_APPNAME", "")  # free; request at https://apidoc.reliefweb.int/
+
     # ── Admin auth ───────────────────────────────────────────────────────────
     ADMIN_USERNAME       = os.getenv("ADMIN_USERNAME", "")
     ADMIN_PASSWORD       = os.getenv("ADMIN_PASSWORD", "")

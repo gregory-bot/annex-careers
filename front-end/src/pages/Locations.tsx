@@ -2,10 +2,12 @@ import { Link } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { motion } from "framer-motion";
 import Layout from "@/components/Layout";
+import { useDocumentMeta } from "@/lib/seo";
 import { useLocations } from "@/lib/jobStore";
 import { isValidLocation } from "@/lib/locationUtils";
 
 const Locations = () => {
+  useDocumentMeta({ title: "Jobs by Location", description: "Find jobs in Nairobi, Mombasa, Kisumu, Nakuru and across Kenya, plus remote roles." });
   const { locations: rawLocations, isLoading: loading } = useLocations();
   const locations = rawLocations.filter((l) => isValidLocation(l.name));
 

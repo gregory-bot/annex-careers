@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import Layout from "@/components/Layout";
+import { useDocumentMeta } from "@/lib/seo";
 
 const steps = [
   {
@@ -37,6 +38,7 @@ const whyReasons = [
 ];
 
 const About = () => {
+  useDocumentMeta({ title: "About Annex Careers", description: "Annex Careers aggregates verified job opportunities from top companies in Kenya with direct apply links." });
   return (
     <Layout>
       <div className="pt-28 md:pt-36 lg:pt-20">

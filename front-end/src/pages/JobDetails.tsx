@@ -1,9 +1,10 @@
 import { useParams, Link } from "react-router-dom";
 import { useEffect } from "react";
-import { ArrowLeft, MapPin, Briefcase, Clock, ExternalLink, Share2, CalendarClock, Building2, Loader2, FileCheck } from "lucide-react";
+import { ArrowLeft, MapPin, Briefcase, Clock, ExternalLink, Share2, CalendarClock, Building2, Loader2, FileCheck, FileText, Hourglass, Wallet } from "lucide-react";
 import Layout from "@/components/Layout";
 import JobCard from "@/components/JobCard";
 import { useJob, useAllJobs, trackAnalyticsEvent } from "@/lib/jobStore";
+import { useDocumentMeta, excerpt } from "@/lib/seo";
 import { toast } from "sonner";
 
 function formatDate(dateStr: string): string {
@@ -72,6 +73,31 @@ const JobDetails = () => {
     if (job) void trackAnalyticsEvent("page_view", job.id);
   }, [job]);
 
+  // Title, description and share tags for this job (browsers, Google, bookmarks).
+  const context = job
+    ? [job.location, job.type, job.application_deadline ? `Deadline ${formatDate(job.application_deadline)}` : ""].filter(Boolean).join(" \u00b7 ")
+    : "";
+  useDocumentMeta(job ? {
+    title: job.company ? `${job.title} at ${job.company}` : job.title,
+    description: excerpt(`${context ? `${context}. ` : ""}${job.description || "View the full job details and apply directly on Annex Careers."}`),
+    type: "article",
+    jsonLd: {
+      "@context": "https://schema.org",
+      "@type": "JobPosting",
+      title: job.title,
+      description: excerpt(job.description, 5000) || job.title,
+      url: `${window.location.origin}/jobs/${job.id}`,
+      identifier: { "@type": "PropertyValue", name: "Annex Careers", value: job.id },
+      hiringOrganization: { "@type": "Organization", name: job.company || "Company not listed" },
+      ...(job.posted ? { datePosted: job.posted.slice(0, 10) } : {}),
+      ...(job.application_deadline ? { validThrough: job.application_deadline } : {}),
+      ...(job.type ? { employmentType: job.type.toUpperCase().replace(/[-\s]/g, "_") } : {}),
+      ...(job.remote ? { jobLocationType: "TELECOMMUTE" } : {}),
+      ...(job.location ? { jobLocation: { "@type": "Place", address: { "@type": "PostalAddress", addressLocality: job.location } } } : {}),
+      directApply: false,
+    },
+  } : null);
+
   if (loading) {
     return (
       <Layout>
@@ -96,12 +122,28 @@ const JobDetails = () => {
 
   const similarJobs = allJobs.filter((j) => j.id !== job.id && (j.category === job.category || j.company === job.company)).slice(0, 3);
 
-  const handleShare = () => {
-    navigator.clipboard.writeText(window.location.href);
-    toast.success("Link copied to clipboard!");
+  const handleShare = async () => {
+    const url = `${window.location.origin}/jobs/${job.id}`;
+    const title = job.company ? `${job.title} at ${job.company}` : job.title;
+    // Native share sheet on phones (WhatsApp, X, LinkedIn...); clipboard elsewhere.
+    if (typeof navigator.share === "function") {
+      try {
+        await navigator.share({ title, text: `${title} - via Annex Careers`, url });
+        return;
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") return;
+      }
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      toast.success("Link copied to clipboard!");
+    } catch {
+      toast.error("Could not copy the link");
+    }
   };
 
   const applyLink = job.apply_url || job.url || "#";
+  const isContract = job.kind === "contract";
   const hasDescription = job.description && job.description.trim().length > 0;
   const hasRequirements = job.requirements && job.requirements.length > 0;
 
@@ -113,8 +155,8 @@ const JobDetails = () => {
     <Layout>
       <div className="pt-28 md:pt-36 lg:pt-20">
         <div className="container py-6 sm:py-8 px-4">
-          <Link to="/jobs" className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground mb-4 mt-2 block">
-            <ArrowLeft size={16} /> Back to jobs
+          <Link to={isContract ? "/contracts" : "/jobs"} className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground mb-4 mt-2 block">
+            <ArrowLeft size={16} /> {isContract ? "Back to contracts" : "Back to jobs"}
           </Link>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 sm:gap-8">
@@ -132,16 +174,23 @@ const JobDetails = () => {
                     <p className="font-heading font-semibold text-sm sm:text-base text-foreground truncate">
                       {job.company || "Company not listed"}
                     </p>
-                    <p className="text-xs text-muted-foreground">Hiring company</p>
+                    <p className="text-xs text-muted-foreground">{isContract ? "Contracting organization" : "Hiring company"}</p>
                   </div>
                 </div>
 
+                {isContract && (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-orange-100 text-orange-700 mb-2">
+                    <FileText size={11} /> Contract / Consultancy
+                  </span>
+                )}
                 <h1 className="font-heading text-lg sm:text-2xl font-bold mb-4">{job.title}</h1>
 
                 <div className="flex flex-wrap gap-3 sm:gap-4 text-sm text-muted-foreground mb-4 sm:mb-6">
                   {job.location && <span className="flex items-center gap-1"><MapPin size={14} /> {job.location}</span>}
                   {job.type && <span className="flex items-center gap-1"><Briefcase size={14} /> {job.type}</span>}
                   {job.posted && <span className="flex items-center gap-1"><Clock size={14} /> Posted {formatDate(job.posted)}</span>}
+                  {isContract && job.duration && <span className="flex items-center gap-1"><Hourglass size={14} /> {job.duration}</span>}
+                  {isContract && job.budget && <span className="flex items-center gap-1"><Wallet size={14} /> {job.budget}</span>}
                   {job.application_deadline && (
                     <span className="flex items-center gap-1 text-orange-600">
                       <CalendarClock size={14} /> Deadline: {formatDate(job.application_deadline)}
@@ -151,7 +200,7 @@ const JobDetails = () => {
 
                 {job.salary && <p className="font-heading text-lg sm:text-xl font-bold text-primary mb-4 sm:mb-6">{job.salary}</p>}
 
-                <h2 className="font-heading font-semibold text-base sm:text-lg mb-3">Description</h2>
+                <h2 className="font-heading font-semibold text-base sm:text-lg mb-3">{isContract ? "Scope of Work / Terms of Reference" : "Description"}</h2>
                 {hasDescription ? (
                   <div className="mb-6 break-words overflow-hidden">
                     <JobDescription description={job.description} />
@@ -215,18 +264,28 @@ const JobDetails = () => {
                     onClick={handleApplyClick}
                     className="w-full flex items-center justify-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-xl font-medium text-sm hover:opacity-90 transition-opacity"
                   >
-                    <ExternalLink size={16} /> Apply Now
+                    <ExternalLink size={16} /> {isContract ? "Apply / Submit Proposal" : "Apply Now"}
                   </a>
                 ) : (
                   <div className="w-full flex items-center justify-center gap-2 px-6 py-3 bg-muted text-muted-foreground rounded-xl font-medium text-sm cursor-not-allowed">
                     Application link not available
                   </div>
                 )}
+                {isContract && job.tor_url && (
+                  <a
+                    href={job.tor_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full flex items-center justify-center gap-2 px-6 py-3 border border-orange-300 text-orange-700 bg-orange-50 rounded-xl font-medium text-sm hover:bg-orange-100 transition-colors"
+                  >
+                    <FileText size={16} /> View Terms of Reference
+                  </a>
+                )}
                 <button
                   onClick={handleShare}
                   className="w-full flex items-center justify-center gap-2 px-6 py-3 border border-border rounded-xl font-medium text-sm hover:bg-muted transition-colors"
                 >
-                  <Share2 size={16} /> Share Job
+                  <Share2 size={16} /> {isContract ? "Share Contract" : "Share Job"}
                 </button>
                 <Link
                   to={`/chat?jobId=${job.id}`}
@@ -243,8 +302,10 @@ const JobDetails = () => {
                 )}
 
                 <div className="border-t border-border pt-3 mt-3 space-y-2 text-xs text-muted-foreground">
-                  {job.company && <p><span className="font-medium text-foreground">Company:</span> {job.company}</p>}
+                  {job.company && <p><span className="font-medium text-foreground">{isContract ? "Organization:" : "Company:"}</span> {job.company}</p>}
                   {job.type && <p><span className="font-medium text-foreground">Type:</span> {job.type}</p>}
+                  {isContract && job.duration && <p><span className="font-medium text-foreground">Duration:</span> {job.duration}</p>}
+                  {isContract && job.budget && <p><span className="font-medium text-foreground">Budget / Fee:</span> {job.budget}</p>}
                   {job.location && <p><span className="font-medium text-foreground">Location:</span> {job.location}</p>}
                 </div>
               </div>

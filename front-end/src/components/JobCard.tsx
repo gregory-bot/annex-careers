@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { MapPin, Clock, CalendarClock, Building2, DollarSign } from "lucide-react";
+import { MapPin, Clock, CalendarClock, Building2, DollarSign, FileText, Hourglass } from "lucide-react";
 import type { Job } from "@/lib/jobStore";
 
 function formatDeadline(deadline: string): string {
@@ -40,6 +40,7 @@ const JobCard = ({ job }: { job: Job }) => {
     ? job.company.split(" ").slice(0, 2).map((w) => w[0]?.toUpperCase()).join("")
     : "";
   const jobType = job.type?.toLowerCase().trim() || "";
+  const isContract = job.kind === "contract";
 
   return (
     <Link
@@ -62,9 +63,9 @@ const JobCard = ({ job }: { job: Job }) => {
               Full-time
             </span>
           )}
-          {jobType && jobType.includes("contract") && (
-            <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300">
-              Contract
+          {(isContract || jobType.includes("contract")) && (
+            <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300 inline-flex items-center gap-1">
+              {isContract && <FileText size={9} />}{isContract ? (jobType.includes("consult") ? "Consultancy" : "Contract") : "Contract"}
             </span>
           )}
           {jobType && jobType.includes("part") && (
@@ -77,7 +78,7 @@ const JobCard = ({ job }: { job: Job }) => {
               Internship
             </span>
           )}
-          {jobType && !isRemote && !jobType.includes("full") && !jobType.includes("contract") && !jobType.includes("part") && !jobType.includes("internship") && (
+          {jobType && !isRemote && !isContract && !jobType.includes("full") && !jobType.includes("contract") && !jobType.includes("part") && !jobType.includes("internship") && (
             <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-muted text-muted-foreground capitalize">
               {job.type}
             </span>
@@ -111,6 +112,11 @@ const JobCard = ({ job }: { job: Job }) => {
             <Clock size={11} className="shrink-0" /> {postedAgo}
           </span>
         )}
+        {isContract && job.duration && (
+          <span className="flex items-center gap-1">
+            <Hourglass size={11} className="shrink-0" /> {job.duration}
+          </span>
+        )}
       </div>
 
       {/* Deadline warning */}
@@ -128,13 +134,13 @@ const JobCard = ({ job }: { job: Job }) => {
 
       {/* Footer: salary + more */}
       <div className="flex items-center justify-between mt-auto pt-3 border-t border-border gap-2">
-        {job.salary ? (
+        {(isContract ? job.budget || job.salary : job.salary) ? (
           <span className="flex items-center gap-1 text-xs font-semibold text-foreground">
             <DollarSign size={11} className="text-primary shrink-0" />
-            <span className="truncate">{job.salary}</span>
+            <span className="truncate">{isContract ? job.budget || job.salary : job.salary}</span>
           </span>
         ) : (
-          <span className="text-xs text-muted-foreground italic">Salary not listed</span>
+          <span className="text-xs text-muted-foreground italic">{isContract ? "Fee not listed" : "Salary not listed"}</span>
         )}
         <span className="text-xs font-semibold text-white bg-primary px-3 py-1 rounded-md whitespace-nowrap">
           More

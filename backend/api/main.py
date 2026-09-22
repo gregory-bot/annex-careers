@@ -5,6 +5,10 @@ Includes built-in cron scheduler that runs daily at 2PM EAT.
 import hmac
 import math
 import re
+import secrets
+import hashlib
+import html as html_lib
+import json
 import logging
 import smtplib
 import threading
@@ -13,21 +17,23 @@ import jwt
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 from fastapi import FastAPI, Depends, Query, HTTPException, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import Response
+from fastapi.responses import Response, HTMLResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc, text, nullslast
+from sqlalchemy import func, desc, text, nullslast, select
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from airflow_home.database.connection import get_db, init_db, SessionLocal
-from airflow_home.database.models import Job, ScrapeLog, User, UserJobNotification, CVSubmission, AnalyticsEvent
+from airflow_home.database.models import (
+    Job, ScrapeLog, User, UserJobNotification, CVSubmission, AnalyticsEvent, JobSource, EmployerInvite,
+)
 from airflow_home.config.settings import settings
 from api.cv.extract import extract_text_from_upload, CvExtractionError
 from api.cv.parser import parse_cv
@@ -88,6 +94,10 @@ class JobResponse(BaseModel):
     application_deadline: Optional[datetime] = None
     scraped_at: Optional[datetime] = None
     is_active: bool = True
+    kind: str = "job"  # "job" or "contract"
+    tor_url: Optional[str] = None
+    duration: Optional[str] = None
+    budget: Optional[str] = None
 
     class Config:
         orm_mode = True
@@ -104,6 +114,7 @@ class PaginatedResponse(BaseModel):
 class StatsResponse(BaseModel):
     total_jobs: int
     active_jobs: int
+    active_contracts: int = 0
     remote_jobs: int
     job_type_counts: dict
     companies: int
@@ -123,11 +134,53 @@ class CreateJobRequest(BaseModel):
     apply_url: Optional[str] = None
     tags: Optional[str] = None
     application_deadline: Optional[str] = None
+    kind: Literal["job", "contract"] = "job"
+    tor_url: Optional[str] = None  # contracts: link to the Terms of Reference / tender document
+    duration: Optional[str] = None  # contracts: e.g. "3 months"
+    budget: Optional[str] = None  # contracts: e.g. "KES 800,000"
 
 
 class AdminLoginRequest(BaseModel):
     username: str
     password: str
+
+
+class EmployerInviteRequest(BaseModel):
+    company_name: str
+    email: EmailStr
+    contact_name: Optional[str] = None
+    note: Optional[str] = None
+    expires_in_days: Optional[int] = None  # None = access never expires
+    send_email: bool = True
+
+
+class EmployerInviteUpdateRequest(BaseModel):
+    company_name: Optional[str] = None
+    contact_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    note: Optional[str] = None
+    status: Optional[Literal["active", "revoked"]] = None
+    expires_in_days: Optional[int] = None  # >0 sets a new expiry from now, 0 clears it
+
+
+class EmployerLoginRequest(BaseModel):
+    email: EmailStr
+    access_code: str
+
+
+class JobSourceRequest(BaseModel):
+    name: str
+    slug: Optional[str] = None  # derived from name when omitted
+    urls: List[str]  # listing-page URLs
+    link_pattern: Optional[str] = None
+    link_selector: Optional[str] = None
+    description_selector: Optional[str] = None
+    default_company: Optional[str] = None
+    default_location: Optional[str] = None
+    max_jobs: int = 60
+    enabled: bool = True
+    kind: Literal["job", "contract"] = "job"  # what the source lists
+    notes: Optional[str] = None
 
 
 class AnalyticsEventRequest(BaseModel):
@@ -149,15 +202,83 @@ def require_admin(creds: Optional[HTTPAuthorizationCredentials] = Depends(_admin
     if creds is None:
         raise HTTPException(status_code=401, detail="Missing admin token")
     try:
-        jwt.decode(creds.credentials, settings.ADMIN_SESSION_SECRET, algorithms=["HS256"])
+        payload = jwt.decode(creds.credentials, settings.ADMIN_SESSION_SECRET, algorithms=["HS256"])
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired admin token")
+    # Employer-portal tokens are signed with the same secret; keep them out.
+    if payload.get("sub") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+
+# --- Employer portal auth ---
+# Companies invited by the admin sign in with their email + a unique access
+# code (only its hash is stored) and get a token scoped to posting jobs.
+
+EMPLOYER_TOKEN_TTL = timedelta(hours=12)
+ACCESS_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I look-alikes
+
+
+def _generate_access_code() -> str:
+    raw = "".join(secrets.choice(ACCESS_CODE_ALPHABET) for _ in range(12))
+    return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
+
+
+def _normalize_access_code(code: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (code or "").upper())
+
+
+def _hash_access_code(code: str) -> str:
+    return hashlib.sha256(_normalize_access_code(code).encode("utf-8")).hexdigest()
+
+
+def _ensure_invite_usable(invite: EmployerInvite) -> None:
+    if invite.status != "active":
+        raise HTTPException(status_code=403, detail="This access has been revoked. Contact Annex Careers to restore it.")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if invite.expires_at and invite.expires_at < now:
+        raise HTTPException(status_code=403, detail="This access has expired. Contact Annex Careers for a new code.")
+
+
+def require_employer(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_admin_auth_scheme),
+    db: Session = Depends(get_db),
+) -> EmployerInvite:
+    if creds is None:
+        raise HTTPException(status_code=401, detail="Missing employer token")
+    try:
+        payload = jwt.decode(creds.credentials, settings.ADMIN_SESSION_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired session; please sign in again")
+    if payload.get("sub") != "employer" or not payload.get("inv"):
+        raise HTTPException(status_code=403, detail="Employer access required")
+    invite = db.query(EmployerInvite).filter(EmployerInvite.id == payload["inv"]).first()
+    if not invite:
+        raise HTTPException(status_code=401, detail="This access no longer exists")
+    _ensure_invite_usable(invite)
+    return invite
 
 
 # --- Startup ---
 
 logger = logging.getLogger("api")
 scheduler = BackgroundScheduler()
+
+# Manual full-scrape state: one run at a time per process, executed off the
+# request thread so the HTTP call returns immediately instead of holding the
+# connection open for the several minutes a full multi-source scrape takes.
+_scrape_lock = threading.Lock()
+_scrape_state = {"running": False, "started_at": None}
+_running_single_sources: set = set()  # slugs with a manual single-source scrape in flight
+
+
+def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
+    """Timestamps are stored naive-UTC (see runner.py / models.py). Emit them
+    with an explicit +00:00 so browsers don't misread them as local time."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
 
 
 def scheduled_daily_scrape():
@@ -175,13 +296,35 @@ def scheduled_daily_scrape():
     except Exception as e:
         logger.error(f"Scheduled scrape failed: {e}")
 
-    # Runs regardless of scrape outcome above — any jobs that DID scrape
-    # successfully are already committed per-source, so this is safe to run
-    # unconditionally rather than being coupled to full scrape success.
+    # Job-alert emails are no longer sent here: they go out every morning on
+    # their own schedule (see scheduled_job_alerts / JOB_ALERT_HOUR_UTC).
+
+
+# --- Automatic job-alert emails -----------------------------------------------
+# Every stored user (subscribers and CV uploaders) is matched against jobs
+# they have not been emailed about yet and gets one email a day at 8 AM EAT.
+
+_alerts_lock = threading.Lock()
+_alerts_state = {"running": False, "last_run_at": None, "last_summary": None, "last_error": None}
+
+
+def scheduled_job_alerts():
+    with _alerts_lock:
+        if _alerts_state["running"]:
+            logger.info("Job alerts already running; skipping this trigger")
+            return
+        _alerts_state["running"] = True
     try:
-        notify_users_of_new_jobs()
+        summary = notify_users_of_new_jobs()
+        with _alerts_lock:
+            _alerts_state.update(last_run_at=datetime.now(timezone.utc), last_summary=summary, last_error=None)
     except Exception as e:
-        logger.error(f"notify_users_of_new_jobs failed: {e}")
+        logger.error(f"Job alerts failed: {e}")
+        with _alerts_lock:
+            _alerts_state.update(last_run_at=datetime.now(timezone.utc), last_error=str(e)[:300])
+    finally:
+        with _alerts_lock:
+            _alerts_state["running"] = False
 
 
 def keep_alive_ping():
@@ -207,6 +350,18 @@ def startup():
             conn.execute(text(
                 "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS requirements TEXT"
             ))
+            conn.execute(text(
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS employer_invite_id INTEGER"
+            ))
+            for ddl in (
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS kind VARCHAR(20) DEFAULT 'job'",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tor_url VARCHAR(1000)",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS duration VARCHAR(120)",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS budget VARCHAR(120)",
+                "CREATE INDEX IF NOT EXISTS ix_jobs_kind ON jobs (kind)",
+                "ALTER TABLE job_sources ADD COLUMN IF NOT EXISTS kind VARCHAR(20) DEFAULT 'job'",
+            ):
+                conn.execute(text(ddl))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
@@ -225,12 +380,21 @@ def startup():
             logger.info("DB migration: columns/tables ensured")
         except Exception as e:
             logger.warning(f"DB migration note: {e}")
+    _backfill_job_kinds()
 
     scheduler.add_job(
         scheduled_daily_scrape,
         CronTrigger(hour=11, minute=0),  # 11 UTC = 2PM EAT
         id="daily_scrape",
         name="Daily Full Scrape (2PM EAT)",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        scheduled_job_alerts,
+        CronTrigger(hour=settings.JOB_ALERT_HOUR_UTC, minute=0),
+        id="daily_job_alerts",
+        name="Daily Job Alert Emails",
         replace_existing=True,
         misfire_grace_time=3600,
     )
@@ -242,7 +406,46 @@ def startup():
         replace_existing=True,
     )
     scheduler.start()
-    logger.info("Scheduler started: daily scrape at 2PM EAT + keep-alive every 10min")
+    logger.info(
+        f"Scheduler started: daily scrape at 11:00 UTC, job alert emails at "
+        f"{settings.JOB_ALERT_HOUR_UTC:02d}:00 UTC, keep-alive every 10min"
+    )
+
+
+def _reclassify_scraped_jobs(db: Session) -> dict:
+    """Re-run the job/contract classifier over scraped rows still marked as
+    jobs. Manual and employer listings keep whatever kind was chosen for them.
+    Returns counts; caller commits."""
+    from airflow_home.transformers.cleaner import classify_kind
+    rows = (
+        db.query(Job)
+        .filter(Job.kind == "job", ~Job.source.in_(["manual", "employer"]))
+        .all()
+    )
+    changed = 0
+    for job in rows:
+        if classify_kind(job.title, job.description, "job") == "contract":
+            job.kind = "contract"
+            changed += 1
+    return {"scanned": len(rows), "reclassified_as_contract": changed}
+
+
+def _backfill_job_kinds() -> None:
+    """One-off: rows that predate the kind column (NULL) get classified from
+    their text so existing consultancies surface under Contracts."""
+    db = SessionLocal()
+    try:
+        if db.query(Job).filter(Job.kind == None).count() == 0:
+            return
+        db.query(Job).filter(Job.kind == None).update({"kind": "job"}, synchronize_session=False)
+        result = _reclassify_scraped_jobs(db)
+        db.commit()
+        logger.info(f"Job kind backfill: {result}")
+    except Exception as e:
+        logger.warning(f"Job kind backfill skipped: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 
 @app.on_event("shutdown")
@@ -334,11 +537,14 @@ def list_jobs(
     location: Optional[str] = None,
     job_type: Optional[str] = None,
     remote: Optional[bool] = None,
+    kind: Literal["job", "contract", "all"] = Query("job"),
     sort_by: str = Query("scraped_at", pattern="^(scraped_at|posted_date|title|company|salary_min)$"),
     sort_order: str = Query("desc", pattern="^(asc|desc)$"),
     db: Session = Depends(get_db),
 ):
     query = _active_visible_jobs_query(db)
+    if kind != "all":
+        query = query.filter(Job.kind == kind)
 
     if search:
         sf = f"%{search}%"
@@ -464,29 +670,163 @@ def get_admin_analytics(db: Session = Depends(get_db), _admin=Depends(require_ad
     }
 
 
-@app.post("/api/jobs")
-def create_job(req: CreateJobRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+def _job_from_request(
+    req: CreateJobRequest, source: str,
+    company: Optional[str] = None, employer_invite_id: Optional[int] = None,
+) -> Job:
+    """Build (but don't persist) a Job from a manual/employer submission."""
     deadline = None
     if req.application_deadline:
         try:
             deadline = datetime.fromisoformat(req.application_deadline)
         except ValueError:
             pass
-    job = Job(
-        title=req.title, company=req.company, location=req.location,
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return Job(
+        title=req.title.strip(), company=(company or req.company or None), location=req.location,
         description=req.description, requirements=req.requirements,
         job_type=req.job_type,
         experience_level=req.experience_level, remote=req.remote,
-        url=req.apply_url, apply_url=req.apply_url, source="manual",
+        url=req.apply_url, apply_url=req.apply_url, source=source,
         tags=req.tags, application_deadline=deadline,
-        posted_date=datetime.now(timezone.utc),
-        scraped_at=datetime.now(timezone.utc), is_active=True,
+        posted_date=now, scraped_at=now, is_active=True,
+        employer_invite_id=employer_invite_id,
+        kind=req.kind or "job",
+        tor_url=(req.tor_url or "").strip() or None,
+        duration=(req.duration or "").strip() or None,
+        budget=(req.budget or "").strip() or None,
     )
+
+
+@app.post("/api/jobs")
+def create_job(req: CreateJobRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    if not req.title or not req.title.strip():
+        raise HTTPException(status_code=400, detail="Job title is required")
+    job = _job_from_request(req, source="manual")
     db.add(job)
     db.commit()
     db.refresh(job)
     logger.info(f"Manual job created: {job.id} - {job.title}")
     return {"message": "Job created", "job_id": job.id}
+
+
+# --- Admin job management ---
+
+@app.get("/api/admin/jobs", response_model=PaginatedResponse)
+def admin_list_jobs(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=100),
+    search: Optional[str] = None,
+    status: Literal["all", "active", "inactive"] = Query("all"),
+    kind: Literal["all", "job", "contract"] = Query("all"),
+    source: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _admin=Depends(require_admin),
+):
+    """Every job in the database, with no public-visibility filter, so the
+    admin can find, repost or delete anything, including rows hidden from
+    the public listing. Paginated and searched server-side so it scales far
+    past what a browser can hold."""
+    query = db.query(Job)
+    if kind != "all":
+        query = query.filter(Job.kind == kind)
+    if status == "active":
+        query = query.filter(Job.is_active == True)
+    elif status == "inactive":
+        query = query.filter(Job.is_active == False)
+    if source:
+        query = query.filter(Job.source == source)
+    if search and search.strip():
+        # Every whitespace-separated term must match at least one field, so
+        # "safaricom marketing" narrows rather than widens.
+        for term in search.strip().split():
+            sf = f"%{term}%"
+            cond = (
+                Job.title.ilike(sf) | Job.company.ilike(sf) | Job.location.ilike(sf)
+                | Job.source.ilike(sf) | Job.tags.ilike(sf)
+            )
+            if term.isdigit():
+                cond = cond | (Job.id == int(term))
+            query = query.filter(cond)
+
+    total = query.count()
+    pages = math.ceil(total / per_page) if total > 0 else 1
+    jobs = (
+        query.order_by(nullslast(desc(Job.scraped_at)), desc(Job.id))
+        .offset((page - 1) * per_page).limit(per_page).all()
+    )
+    return PaginatedResponse(
+        jobs=[JobResponse.from_orm(j) for j in jobs],
+        total=total, page=page, pages=pages, per_page=per_page,
+    )
+
+
+def _delete_job_row(db: Session, job: Job) -> None:
+    """Remove a job and detach its dependants explicitly rather than trusting
+    every deployment's FK ON DELETE clauses to match models.py. Caller commits."""
+    job_id = job.id
+    db.query(UserJobNotification).filter(UserJobNotification.job_id == job_id).delete(synchronize_session=False)
+    db.query(CVSubmission).filter(CVSubmission.job_id == job_id).update({"job_id": None}, synchronize_session=False)
+    db.query(AnalyticsEvent).filter(AnalyticsEvent.job_id == job_id).update({"job_id": None}, synchronize_session=False)
+    db.delete(job)
+
+
+def _repost_job_row(job: Job) -> bool:
+    """Reactivate and bump a job to the top of the listing (which sorts by
+    scraped_at); drop an already-passed deadline that would keep it hidden.
+    Returns whether a deadline was cleared. Caller commits."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    deadline_cleared = False
+    if job.application_deadline and job.application_deadline < now:
+        job.application_deadline = None
+        deadline_cleared = True
+    job.is_active = True
+    job.posted_date = now
+    job.scraped_at = now
+    return deadline_cleared
+
+
+@app.delete("/api/admin/jobs/{job_id}")
+def admin_delete_job(job_id: int, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    title, source = job.title, job.source
+    _delete_job_row(db, job)
+    db.commit()
+    logger.info(f"Admin deleted job {job_id} - {title} ({source})")
+    return {"message": "Job deleted", "job_id": job_id}
+
+
+@app.post("/api/admin/jobs/{job_id}/repost")
+def admin_repost_job(job_id: int, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    """Re-share a job: bump it to the top of the public listing (which sorts
+    by scraped_at), reactivate it, and drop an already-passed deadline that
+    would otherwise keep it hidden. Users not yet emailed about it become
+    eligible again on the next notification cycle."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    deadline_cleared = _repost_job_row(job)
+    db.commit()
+    db.refresh(job)
+    logger.info(f"Admin reposted job {job_id} - {job.title}")
+    return {
+        "message": "Job reposted" + (" and its expired deadline cleared" if deadline_cleared else ""),
+        "job": JobResponse.from_orm(job),
+        "deadline_cleared": deadline_cleared,
+    }
+
+
+@app.post("/api/admin/jobs/reclassify")
+def admin_reclassify_jobs(db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    """Move scraped listings that read like consultancies / TORs / tenders
+    under Contracts. Safe to run repeatedly; manual and employer postings are
+    left alone."""
+    result = _reclassify_scraped_jobs(db)
+    db.commit()
+    logger.info(f"Admin reclassify: {result}")
+    return {"message": f"Scanned {result['scanned']} scraped jobs, moved {result['reclassified_as_contract']} to Contracts", **result}
 
 
 @app.post("/api/jobs/cleanup")
@@ -530,12 +870,21 @@ def list_sources(db: Session = Depends(get_db)):
     return {"sources": {source: count for source, count in results}}
 
 
+def _visible_of_kind(db: Session, kind: str):
+    query = _active_visible_jobs_query(db)
+    return query if kind == "all" else query.filter(Job.kind == kind)
+
+
 @app.get("/api/categories")
-def list_categories(limit: Optional[int] = Query(None, ge=1, le=100), db: Session = Depends(get_db)):
+def list_categories(
+    limit: Optional[int] = Query(None, ge=1, le=100),
+    kind: Literal["job", "contract", "all"] = Query("job"),
+    db: Session = Depends(get_db),
+):
     """Category facet counts, derived from Job.tags (comma-separated).
     Aggregated server-side so the homepage/Categories page don't need to
     download every job row just to compute this."""
-    rows = _active_visible_jobs_query(db).with_entities(Job.tags).all()
+    rows = _visible_of_kind(db, kind).with_entities(Job.tags).all()
     counts: dict = {}
     labels: dict = {}
     for (tags,) in rows:
@@ -558,9 +907,13 @@ def list_categories(limit: Optional[int] = Query(None, ge=1, le=100), db: Sessio
 
 
 @app.get("/api/locations")
-def list_locations(limit: Optional[int] = Query(None, ge=1, le=200), db: Session = Depends(get_db)):
+def list_locations(
+    limit: Optional[int] = Query(None, ge=1, le=200),
+    kind: Literal["job", "contract", "all"] = Query("job"),
+    db: Session = Depends(get_db),
+):
     rows = (
-        _active_visible_jobs_query(db)
+        _visible_of_kind(db, kind)
         .with_entities(Job.location, func.count(Job.id))
         .group_by(Job.location)
         .order_by(desc(func.count(Job.id)))
@@ -573,9 +926,13 @@ def list_locations(limit: Optional[int] = Query(None, ge=1, le=200), db: Session
 
 
 @app.get("/api/companies")
-def list_companies(limit: Optional[int] = Query(None, ge=1, le=200), db: Session = Depends(get_db)):
+def list_companies(
+    limit: Optional[int] = Query(None, ge=1, le=200),
+    kind: Literal["job", "contract", "all"] = Query("job"),
+    db: Session = Depends(get_db),
+):
     rows = (
-        _active_visible_jobs_query(db)
+        _visible_of_kind(db, kind)
         .with_entities(Job.company, func.count(Job.id))
         .group_by(Job.company)
         .order_by(desc(func.count(Job.id)))
@@ -596,6 +953,7 @@ def get_stats(db: Session = Depends(get_db)):
 
     visible = _active_visible_jobs_query(db)
     remote_jobs = visible.filter(Job.remote == True).count()
+    active_contracts = visible.filter(Job.kind == "contract").count()
     job_type_rows = (
         visible.with_entities(Job.job_type, func.count(Job.id))
         .group_by(Job.job_type).all()
@@ -618,7 +976,7 @@ def get_stats(db: Session = Depends(get_db)):
     )
 
     return StatsResponse(
-        total_jobs=total_jobs, active_jobs=active_jobs,
+        total_jobs=total_jobs, active_jobs=active_jobs, active_contracts=active_contracts,
         remote_jobs=remote_jobs, job_type_counts=job_type_counts,
         companies=companies,
         sources={s: c for s, c in source_counts},
@@ -626,7 +984,7 @@ def get_stats(db: Session = Depends(get_db)):
             {
                 "source": log.source, "status": log.status,
                 "jobs_found": log.jobs_found,
-                "started_at": log.started_at.isoformat() if log.started_at else None,
+                "started_at": _iso_utc(log.started_at),
             }
             for log in recent_logs
         ],
@@ -641,8 +999,8 @@ def trigger_scrape(
     max_pages: int = Query(3, ge=1, le=10),
     _admin=Depends(require_admin),
 ):
-    from airflow_home.scrapers.runner import run_scraper, SCRAPER_REGISTRY
-    if source not in SCRAPER_REGISTRY:
+    from airflow_home.scrapers.runner import run_scraper, is_known_source
+    if not is_known_source(source):
         raise HTTPException(status_code=400, detail=f"Unknown source: {source}")
     return run_scraper(source, search_query=search_query, location=location, max_pages=max_pages)
 
@@ -949,18 +1307,15 @@ def _match_jobs_for_interests(db: Session, job_interests: str, limit: int = 5, e
     return query.order_by(desc(Job.scraped_at)).limit(limit).all()
 
 
-def notify_users_of_new_jobs():
-    """Match every stored user against currently-active jobs and email them
-    only the jobs they haven't already been notified about (tracked via
-    UserJobNotification). Intended to run once per scrape cycle — safe to
-    call repeatedly since it's a no-op for users with nothing new to see.
-    Runs outside a request context (from the scheduler), so it opens and
-    closes its own DB session rather than using the get_db() dependency."""
-    if not (settings.BREVO_API_KEY or settings.RESEND_API_KEY or settings.SMTP_PASSWORD):
+def notify_users_of_new_jobs() -> dict:
+    """Match every stored user against currently-active listings and email
+    them only the ones they haven't been notified about (tracked via
+    UserJobNotification). Sends synchronously so the count is real; a failed
+    send leaves no notification row, so that user is retried next time.
+    Runs from the scheduler (no request context), so it owns its session."""
+    if not _email_provider_configured():
         logger.info("notify_users_of_new_jobs: no email provider configured, skipping")
-        return
-
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
+        return {"skipped": True, "reason": "No email provider configured", "users": 0, "emailed": 0, "failed": 0, "jobs_sent": 0}
 
     db = SessionLocal()
     try:
@@ -969,7 +1324,8 @@ def notify_users_of_new_jobs():
             db.query(Job).filter(Job.is_active == True)
             .order_by(desc(Job.scraped_at)).limit(5).all()
         )
-        notified_count = 0
+        emailed = failed = jobs_sent = 0
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         for user in users:
             already_notified = {
                 row.job_id for row in
@@ -979,36 +1335,39 @@ def notify_users_of_new_jobs():
                 candidates = _match_jobs_for_interests(db, user.job_interests, limit=5, exclude_ids=already_notified)
             else:
                 candidates = [j for j in featured if j.id not in already_notified]
-
             if not candidates:
                 continue
 
             if user.job_interests:
                 interest_label = user.job_interests.title()
                 html = build_targeted_email_html(user.name or "there", interest_label, candidates)
-                subject = f"New jobs for {interest_label} professionals — Annex Careers"
+                subject = f"New jobs for {interest_label} professionals - Annex Careers"
             else:
                 html = build_welcome_email_html(candidates, name=user.name)
-                subject = "New jobs matching your profile — Annex Careers"
+                subject = "New jobs matching your profile - Annex Careers"
 
-            send_email_background(user.email, subject, html)
-            user.last_emailed_at = datetime.now(timezone.utc)
+            try:
+                send_email(user.email, subject, html)
+            except Exception as e:
+                failed += 1
+                logger.error(f"Job alert to {user.email} failed: {e}")
+                continue
 
+            user.last_emailed_at = now
             for job in candidates:
-                stmt = pg_insert(UserJobNotification.__table__).values(
-                    user_id=user.id, job_id=job.id, sent_at=datetime.now(timezone.utc)
-                ).on_conflict_do_nothing(index_elements=["user_id", "job_id"])
-                db.execute(stmt)
-            notified_count += 1
+                db.add(UserJobNotification(user_id=user.id, job_id=job.id, sent_at=now))
+            emailed += 1
+            jobs_sent += len(candidates)
 
         db.commit()
-        logger.info(f"notify_users_of_new_jobs: emailed {notified_count} of {len(users)} users")
-    except Exception as e:
-        logger.error(f"notify_users_of_new_jobs failed: {e}")
+        summary = {"skipped": False, "users": len(users), "emailed": emailed, "failed": failed, "jobs_sent": jobs_sent}
+        logger.info(f"notify_users_of_new_jobs: {summary}")
+        return summary
+    except Exception:
         db.rollback()
+        raise
     finally:
         db.close()
-
 
 # --- CV Engine (rule-based, no external AI API) ---
 #
@@ -1252,20 +1611,42 @@ def send_bulk_alerts(req: BulkEmailRequest, db: Session = Depends(get_db), _admi
 
 
 @app.get("/api/scrape-logs")
-def get_scrape_logs(limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db), _admin=Depends(require_admin)):
-    logs = db.query(ScrapeLog).order_by(desc(ScrapeLog.started_at)).limit(limit).all()
+def get_scrape_logs(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=100),
+    source: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _admin=Depends(require_admin),
+):
+    query = db.query(ScrapeLog)
+    if source:
+        query = query.filter(ScrapeLog.source == source)
+    total = query.count()
+    pages = math.ceil(total / per_page) if total > 0 else 1
+    logs = (
+        query.order_by(nullslast(desc(ScrapeLog.started_at)), desc(ScrapeLog.id))
+        .offset((page - 1) * per_page).limit(per_page).all()
+    )
+    with _scrape_lock:
+        in_progress = _scrape_state["running"] or bool(_running_single_sources)
+        running_sources = sorted(_running_single_sources)
     return {
         "logs": [
             {
                 "id": log.id, "source": log.source, "status": log.status,
                 "jobs_found": log.jobs_found, "jobs_new": log.jobs_new,
                 "jobs_updated": log.jobs_updated, "error_message": log.error_message,
-                "started_at": log.started_at.isoformat() if log.started_at else None,
-                "finished_at": log.finished_at.isoformat() if log.finished_at else None,
+                "started_at": _iso_utc(log.started_at),
+                "finished_at": _iso_utc(log.finished_at),
             }
             for log in logs
         ],
-        "total": len(logs),
+        "total": total,
+        "page": page,
+        "pages": pages,
+        "per_page": per_page,
+        "in_progress": in_progress,
+        "running_sources": running_sources,
     }
 
 
@@ -1281,13 +1662,749 @@ def scheduler_status(_admin=Depends(require_admin)):
     }
 
 
-@app.post("/api/scrape-all")
+def _run_full_scrape_in_background(search_query: Optional[str], location: Optional[str], max_pages: int):
+    from airflow_home.scrapers.runner import run_all_scrapers
+    try:
+        results = run_all_scrapers(search_query=search_query, location=location, max_pages=max_pages)
+        total = sum(r.get("jobs_found", 0) for r in results)
+        logger.info(f"Manual scrape-all done: {total} jobs found across {len(results)} sources")
+    except Exception as e:
+        logger.error(f"Manual scrape-all failed: {e}")
+    finally:
+        with _scrape_lock:
+            _scrape_state["running"] = False
+            _scrape_state["started_at"] = None
+
+
+@app.post("/api/scrape-all", status_code=202)
 def trigger_full_scrape(
     search_query: Optional[str] = None,
     location: Optional[str] = Query("Kenya"),
     max_pages: int = Query(3, ge=1, le=10),
     _admin=Depends(require_admin),
 ):
-    from airflow_home.scrapers.runner import run_all_scrapers
-    results = run_all_scrapers(search_query=search_query, location=location, max_pages=max_pages)
-    return {"results": results, "total_found": sum(r.get("jobs_found", 0) for r in results)}
+    """Kick off a full scrape in the background. Each source writes its own
+    ScrapeLog row as it finishes, so progress is visible via /api/scrape-logs
+    without holding this request open for the whole run."""
+    from airflow_home.scrapers.runner import SCRAPER_REGISTRY
+    with _scrape_lock:
+        if _scrape_state["running"]:
+            raise HTTPException(status_code=409, detail="A scrape is already running")
+        _scrape_state["running"] = True
+        _scrape_state["started_at"] = datetime.now(timezone.utc)
+    threading.Thread(
+        target=_run_full_scrape_in_background,
+        args=(search_query, location, max_pages),
+        name="manual-scrape-all",
+        daemon=True,
+    ).start()
+    return {"message": "Scrape started", "started": True, "sources": len(SCRAPER_REGISTRY)}
+
+
+# --- Admin job sources -------------------------------------------------------
+# Built-in scrapers live in SCRAPER_REGISTRY (code). Custom sources live in the
+# job_sources table and are scraped by GenericSiteScraper; run_all_scrapers()
+# includes every enabled one, so the daily schedule picks them up automatically.
+
+def _slugify(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (value or "").lower()).strip("_")[:100]
+
+
+def _clean_optional(value: Optional[str]) -> Optional[str]:
+    value = (value or "").strip()
+    return value or None
+
+
+def _validate_source_request(req: JobSourceRequest) -> tuple[str, list[str]]:
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Source name is required")
+    urls = [u.strip() for u in req.urls if u and u.strip()]
+    if not urls:
+        raise HTTPException(status_code=400, detail="At least one listing URL is required")
+    for url in urls:
+        if not re.match(r"^https?://[^\s/$.?#].[^\s]*$", url, re.I):
+            raise HTTPException(status_code=400, detail=f"Invalid URL: {url}")
+    if req.link_pattern and req.link_pattern.strip():
+        try:
+            re.compile(req.link_pattern)
+        except re.error as e:
+            raise HTTPException(status_code=400, detail=f"Invalid link pattern (regex): {e}")
+    if not 1 <= req.max_jobs <= 500:
+        raise HTTPException(status_code=400, detail="Max jobs per run must be between 1 and 500")
+    return name, urls
+
+
+def _apply_source_request(src: JobSource, req: JobSourceRequest, name: str, urls: list[str]) -> None:
+    src.name = name
+    src.urls = "\n".join(urls)
+    src.link_pattern = _clean_optional(req.link_pattern)
+    src.link_selector = _clean_optional(req.link_selector)
+    src.description_selector = _clean_optional(req.description_selector)
+    src.default_company = _clean_optional(req.default_company)
+    src.default_location = _clean_optional(req.default_location)
+    src.max_jobs = req.max_jobs
+    src.enabled = req.enabled
+    src.kind = req.kind
+    src.notes = _clean_optional(req.notes)
+
+
+def _log_summary(log: Optional[ScrapeLog]) -> Optional[dict]:
+    if log is None:
+        return None
+    return {
+        "status": log.status, "jobs_found": log.jobs_found, "jobs_new": log.jobs_new,
+        "jobs_updated": log.jobs_updated, "error_message": log.error_message,
+        "started_at": _iso_utc(log.started_at), "finished_at": _iso_utc(log.finished_at),
+    }
+
+
+def _latest_logs_by_source(db: Session) -> dict:
+    latest_ids = select(func.max(ScrapeLog.id)).group_by(ScrapeLog.source)
+    return {log.source: log for log in db.query(ScrapeLog).filter(ScrapeLog.id.in_(latest_ids)).all()}
+
+
+def _source_to_dict(src: JobSource, last_run: Optional[ScrapeLog] = None) -> dict:
+    return {
+        "id": src.id, "name": src.name, "slug": src.slug, "type": "custom",
+        "urls": [u for u in (src.urls or "").splitlines() if u.strip()],
+        "link_pattern": src.link_pattern, "link_selector": src.link_selector,
+        "description_selector": src.description_selector,
+        "default_company": src.default_company, "default_location": src.default_location,
+        "max_jobs": src.max_jobs, "enabled": bool(src.enabled), "kind": src.kind or "job", "notes": src.notes,
+        "created_at": _iso_utc(src.created_at), "updated_at": _iso_utc(src.updated_at),
+        "last_run": _log_summary(last_run),
+    }
+
+
+def _ensure_slug_free(db: Session, slug: str, exclude_id: Optional[int] = None) -> None:
+    from airflow_home.scrapers.runner import SCRAPER_REGISTRY
+    if slug in SCRAPER_REGISTRY:
+        raise HTTPException(status_code=409, detail=f"'{slug}' is already a built-in source")
+    query = db.query(JobSource).filter(JobSource.slug == slug)
+    if exclude_id is not None:
+        query = query.filter(JobSource.id != exclude_id)
+    if query.first():
+        raise HTTPException(status_code=409, detail=f"A source with slug '{slug}' already exists")
+
+
+@app.get("/api/admin/sources")
+def admin_list_sources(db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    from airflow_home.scrapers.runner import SCRAPER_REGISTRY
+    latest = _latest_logs_by_source(db)
+    with _scrape_lock:
+        running = sorted(_running_single_sources)
+        full_running = _scrape_state["running"]
+    builtin = [
+        {"slug": slug, "name": slug.replace("_", " ").title(), "type": "builtin", "last_run": _log_summary(latest.get(slug))}
+        for slug in sorted(SCRAPER_REGISTRY)
+    ]
+    custom = [
+        _source_to_dict(src, latest.get(src.slug))
+        for src in db.query(JobSource).order_by(desc(JobSource.created_at), desc(JobSource.id)).all()
+    ]
+    return {"builtin": builtin, "custom": custom, "running_sources": running, "full_scrape_running": full_running}
+
+
+@app.post("/api/admin/sources", status_code=201)
+def admin_create_source(req: JobSourceRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    name, urls = _validate_source_request(req)
+    slug = _slugify(req.slug or name)
+    if not slug:
+        raise HTTPException(status_code=400, detail="Could not derive a slug from that name; set one explicitly")
+    _ensure_slug_free(db, slug)
+    src = JobSource(slug=slug)
+    _apply_source_request(src, req, name, urls)
+    db.add(src)
+    db.commit()
+    db.refresh(src)
+    logger.info(f"Admin added job source {slug} ({len(urls)} URL(s))")
+    return _source_to_dict(src)
+
+
+@app.put("/api/admin/sources/{source_id}")
+def admin_update_source(source_id: int, req: JobSourceRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    src = db.query(JobSource).filter(JobSource.id == source_id).first()
+    if not src:
+        raise HTTPException(status_code=404, detail="Source not found")
+    name, urls = _validate_source_request(req)
+    if req.slug and _slugify(req.slug) != src.slug:
+        new_slug = _slugify(req.slug)
+        if not new_slug:
+            raise HTTPException(status_code=400, detail="Invalid slug")
+        _ensure_slug_free(db, new_slug, exclude_id=src.id)
+        src.slug = new_slug
+    _apply_source_request(src, req, name, urls)
+    db.commit()
+    db.refresh(src)
+    return _source_to_dict(src, _latest_logs_by_source(db).get(src.slug))
+
+
+@app.delete("/api/admin/sources/{source_id}")
+def admin_delete_source(source_id: int, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    src = db.query(JobSource).filter(JobSource.id == source_id).first()
+    if not src:
+        raise HTTPException(status_code=404, detail="Source not found")
+    slug = src.slug
+    db.delete(src)
+    db.commit()
+    logger.info(f"Admin removed job source {slug}")
+    return {"message": "Source deleted. Jobs already collected from it were kept.", "slug": slug}
+
+
+def _run_single_scrape_in_background(source: str) -> None:
+    from airflow_home.scrapers.runner import run_scraper
+    try:
+        run_scraper(source, max_pages=3)
+    except Exception as e:
+        logger.error(f"Manual scrape of {source} failed: {e}")
+    finally:
+        with _scrape_lock:
+            _running_single_sources.discard(source)
+
+
+@app.post("/api/admin/scrape/{source}", status_code=202)
+def trigger_source_scrape(source: str, _admin=Depends(require_admin)):
+    """Scrape one source (built-in or custom) in the background. Its result
+    lands in the scrape logs like any other run."""
+    from airflow_home.scrapers.runner import is_known_source
+    if not is_known_source(source):
+        raise HTTPException(status_code=404, detail=f"Unknown source: {source}")
+    with _scrape_lock:
+        if source in _running_single_sources:
+            raise HTTPException(status_code=409, detail=f"A scrape of {source} is already running")
+        _running_single_sources.add(source)
+    threading.Thread(
+        target=_run_single_scrape_in_background, args=(source,),
+        name=f"scrape-{source}", daemon=True,
+    ).start()
+    return {"message": f"Scrape started for {source}", "started": True, "source": source}
+
+
+# --- Employer portal -----------------------------------------------------------
+# Marketing flow: the admin invites a company; the company gets an email with
+# the portal link and a unique access code; the code unlocks only the
+# job-posting page. Jobs they post go live immediately with source "employer".
+
+def _portal_url() -> str:
+    return f"{settings.FRONTEND_URL.rstrip('/')}/employer"
+
+
+def _expiry_from_days(days: Optional[int]) -> Optional[datetime]:
+    if days is None or days <= 0:
+        return None
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=days)
+
+
+def _invite_to_dict(invite: EmployerInvite, jobs_posted: int = 0) -> dict:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return {
+        "id": invite.id,
+        "company_name": invite.company_name,
+        "contact_name": invite.contact_name,
+        "email": invite.email,
+        "status": invite.status,
+        "expired": bool(invite.expires_at and invite.expires_at < now),
+        "note": invite.note,
+        "created_at": _iso_utc(invite.created_at),
+        "expires_at": _iso_utc(invite.expires_at),
+        "email_sent_at": _iso_utc(invite.email_sent_at),
+        "last_login_at": _iso_utc(invite.last_login_at),
+        "jobs_posted": jobs_posted,
+    }
+
+
+def build_employer_invite_email_html(invite: EmployerInvite, access_code: str, portal_url: str) -> str:
+    greeting = f"Hello {invite.contact_name}," if invite.contact_name else f"Hello {invite.company_name} team,"
+    expiry_note = (
+        f'<p style="margin:12px 0 0;color:#6b7280;font-size:12px;">This access is valid until {invite.expires_at.strftime("%d %B %Y")}.</p>'
+        if invite.expires_at else ""
+    )
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:24px 0;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0"
+        style="max-width:600px;width:100%;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+        <tr>
+          <td style="background:#dc2626;padding:28px 24px;text-align:center;">
+            <h1 style="margin:0;color:#ffffff;font-size:26px;font-weight:700;">Annex Careers</h1>
+            <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:13px;">Employer job posting</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 24px 8px;">
+            <h2 style="margin:0 0 8px;color:#111827;font-size:20px;font-weight:700;">{greeting}</h2>
+            <p style="margin:0 0 6px;color:#374151;font-size:14px;line-height:1.6;">
+              <strong>{invite.company_name}</strong> has been given access to post vacancies directly on Annex Careers,
+              where thousands of job seekers in Kenya browse every day. Use the link and access code below.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:8px 24px;">
+            <table width="100%" cellpadding="0" cellspacing="0" style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;">
+              <tr>
+                <td style="padding:18px 20px;">
+                  <div style="color:#6b7280;font-size:12px;text-transform:uppercase;letter-spacing:.06em;">Your access code</div>
+                  <div style="color:#111827;font-size:26px;font-weight:700;letter-spacing:.12em;font-family:Menlo,Consolas,monospace;margin-top:6px;">{access_code}</div>
+                  <div style="color:#6b7280;font-size:12px;margin-top:6px;">Sign in with this code and the email address this message was sent to: <strong>{invite.email}</strong></div>
+                  {expiry_note}
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:16px 24px 8px;">
+            <ol style="margin:0;padding-left:20px;color:#374151;font-size:14px;line-height:1.8;">
+              <li>Open the employer page: <a href="{portal_url}" style="color:#dc2626;">{portal_url}</a></li>
+              <li>Enter your email address and the access code above.</li>
+              <li>Fill in the job form. Your vacancy goes live on the site immediately.</li>
+            </ol>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 24px 8px;text-align:center;">
+            <a href="{portal_url}"
+               style="display:inline-block;background:#dc2626;color:#ffffff;font-size:15px;
+                      font-weight:600;padding:12px 36px;border-radius:8px;text-decoration:none;">
+              Post a Job
+            </a>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:16px 24px 28px;">
+            <p style="margin:0;color:#6b7280;font-size:12px;line-height:1.6;">
+              Keep this code private; it is unique to {invite.company_name}. If you did not expect this email or need a new code,
+              reply to this message and we will help.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 24px;text-align:center;border-top:1px solid #e5e7eb;">
+            <p style="margin:0 0 6px;color:#9ca3af;font-size:12px;">&copy; {datetime.now().year} Annex Careers</p>
+            <p style="margin:0;color:#9ca3af;font-size:11px;">
+              <a href="{SITE_URL}" style="color:#dc2626;text-decoration:none;">careers.annex-technologies.com</a>
+            </p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+
+def _email_provider_configured() -> bool:
+    return bool(settings.BREVO_API_KEY or settings.RESEND_API_KEY or settings.SMTP_PASSWORD)
+
+
+def _send_employer_invite_email(invite: EmployerInvite, access_code: str) -> tuple[bool, Optional[str]]:
+    """Send the invite email synchronously and report what actually happened,
+    so the admin sees a real failure (bad SMTP password, rejected sender...)
+    instead of a hopeful "emailed". Returns (emailed, error_message)."""
+    if not _email_provider_configured():
+        logger.info(f"Employer invite for {invite.email} not emailed: no email provider configured")
+        return False, "No email provider is configured on the server (BREVO_API_KEY, RESEND_API_KEY or SMTP_PASSWORD)."
+    html = build_employer_invite_email_html(invite, access_code, _portal_url())
+    subject = f"Post your jobs on Annex Careers - access for {invite.company_name}"
+    try:
+        send_email(invite.email, subject, html)
+    except Exception as e:
+        logger.error(f"Employer invite email to {invite.email} failed: {e}")
+        return False, f"{type(e).__name__}: {str(e)[:300]}"
+    invite.email_sent_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    return True, None
+
+
+def _employer_job_counts(db: Session) -> dict:
+    rows = (
+        db.query(Job.employer_invite_id, func.count(Job.id))
+        .filter(Job.employer_invite_id != None)
+        .group_by(Job.employer_invite_id).all()
+    )
+    return {invite_id: count for invite_id, count in rows}
+
+
+# -- admin side --
+
+@app.get("/api/admin/employers")
+def admin_list_employers(db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    counts = _employer_job_counts(db)
+    invites = db.query(EmployerInvite).order_by(desc(EmployerInvite.created_at), desc(EmployerInvite.id)).all()
+    return {
+        "employers": [_invite_to_dict(inv, counts.get(inv.id, 0)) for inv in invites],
+        "portal_url": _portal_url(),
+        "email_configured": _email_provider_configured(),
+    }
+
+
+@app.post("/api/admin/employers", status_code=201)
+def admin_create_employer(req: EmployerInviteRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    company = (req.company_name or "").strip()
+    if not company:
+        raise HTTPException(status_code=400, detail="Company name is required")
+    email = req.email.lower().strip()
+    existing = db.query(EmployerInvite).filter(
+        func.lower(EmployerInvite.email) == email, EmployerInvite.status == "active",
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"{email} already has active access ({existing.company_name}). Resend or revoke that invite instead.")
+
+    code = _generate_access_code()
+    invite = EmployerInvite(
+        company_name=company,
+        contact_name=(req.contact_name or "").strip() or None,
+        email=email,
+        access_code_hash=_hash_access_code(code),
+        status="active",
+        note=(req.note or "").strip() or None,
+        expires_at=_expiry_from_days(req.expires_in_days),
+    )
+    db.add(invite)
+    db.commit()
+    db.refresh(invite)
+    emailed, email_error = _send_employer_invite_email(invite, code) if req.send_email else (False, None)
+    db.commit()
+    logger.info(f"Employer invite created for {company} <{email}> (emailed={emailed})")
+    # The plain code is returned exactly once so the admin can pass it on if
+    # the email does not arrive; only its hash is stored.
+    return {
+        **_invite_to_dict(invite, 0), "access_code": code, "emailed": emailed,
+        "email_error": email_error, "portal_url": _portal_url(),
+    }
+
+
+@app.post("/api/admin/employers/{invite_id}/resend")
+def admin_resend_employer(
+    invite_id: int, send_email: bool = Query(True),
+    db: Session = Depends(get_db), _admin=Depends(require_admin),
+):
+    """Issue a fresh access code (the old one stops working) and email it."""
+    invite = db.query(EmployerInvite).filter(EmployerInvite.id == invite_id).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    if invite.status != "active":
+        raise HTTPException(status_code=409, detail="This invite is revoked; reactivate it first")
+    code = _generate_access_code()
+    invite.access_code_hash = _hash_access_code(code)
+    emailed, email_error = _send_employer_invite_email(invite, code) if send_email else (False, None)
+    db.commit()
+    db.refresh(invite)
+    counts = _employer_job_counts(db)
+    return {
+        **_invite_to_dict(invite, counts.get(invite.id, 0)), "access_code": code, "emailed": emailed,
+        "email_error": email_error, "portal_url": _portal_url(),
+    }
+
+
+@app.patch("/api/admin/employers/{invite_id}")
+def admin_update_employer(invite_id: int, req: EmployerInviteUpdateRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    invite = db.query(EmployerInvite).filter(EmployerInvite.id == invite_id).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    if req.company_name is not None:
+        if not req.company_name.strip():
+            raise HTTPException(status_code=400, detail="Company name cannot be empty")
+        invite.company_name = req.company_name.strip()
+    if req.contact_name is not None:
+        invite.contact_name = req.contact_name.strip() or None
+    if req.email is not None:
+        invite.email = req.email.lower().strip()
+    if req.note is not None:
+        invite.note = req.note.strip() or None
+    if req.status is not None:
+        invite.status = req.status
+    if req.expires_in_days is not None:
+        invite.expires_at = _expiry_from_days(req.expires_in_days)
+    db.commit()
+    db.refresh(invite)
+    return _invite_to_dict(invite, _employer_job_counts(db).get(invite.id, 0))
+
+
+@app.delete("/api/admin/employers/{invite_id}")
+def admin_delete_employer(invite_id: int, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+    invite = db.query(EmployerInvite).filter(EmployerInvite.id == invite_id).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    # Their jobs stay live; they just lose the link back to this invite.
+    db.query(Job).filter(Job.employer_invite_id == invite_id).update({"employer_invite_id": None}, synchronize_session=False)
+    db.delete(invite)
+    db.commit()
+    return {"message": "Invite deleted. Jobs already posted were kept.", "id": invite_id}
+
+
+# -- company side --
+
+@app.post("/api/employer/login")
+def employer_login(req: EmployerLoginRequest, db: Session = Depends(get_db)):
+    if not settings.ADMIN_SESSION_SECRET:
+        raise HTTPException(status_code=503, detail="Employer login is not configured")
+    email = req.email.lower().strip()
+    code_hash = _hash_access_code(req.access_code)
+    candidates = db.query(EmployerInvite).filter(func.lower(EmployerInvite.email) == email).all()
+    invite = next((inv for inv in candidates if hmac.compare_digest(inv.access_code_hash, code_hash)), None)
+    if invite is None:
+        raise HTTPException(status_code=401, detail="Invalid email or access code")
+    _ensure_invite_usable(invite)
+    now = datetime.now(timezone.utc)
+    invite.last_login_at = now.replace(tzinfo=None)
+    db.commit()
+    expires_at = now + EMPLOYER_TOKEN_TTL
+    token = jwt.encode({"sub": "employer", "inv": invite.id, "exp": expires_at}, settings.ADMIN_SESSION_SECRET, algorithm="HS256")
+    return {
+        "token": token,
+        "expires_at": expires_at.isoformat(),
+        "company_name": invite.company_name,
+        "contact_name": invite.contact_name,
+    }
+
+
+@app.get("/api/employer/me")
+def employer_me(invite: EmployerInvite = Depends(require_employer), db: Session = Depends(get_db)):
+    jobs = (
+        db.query(Job).filter(Job.employer_invite_id == invite.id)
+        .order_by(desc(Job.scraped_at), desc(Job.id)).all()
+    )
+    # Engagement per job: page_view = someone opened the job page,
+    # apply_click = someone pressed Apply Now on it.
+    stats: dict = {}
+    if jobs:
+        rows = (
+            db.query(AnalyticsEvent.job_id, AnalyticsEvent.event_type, func.count(AnalyticsEvent.id))
+            .filter(AnalyticsEvent.job_id.in_([j.id for j in jobs]))
+            .group_by(AnalyticsEvent.job_id, AnalyticsEvent.event_type).all()
+        )
+        for job_id, event_type, count in rows:
+            stats.setdefault(job_id, {})[event_type] = count
+    return {
+        "company_name": invite.company_name,
+        "contact_name": invite.contact_name,
+        "email": invite.email,
+        "expires_at": _iso_utc(invite.expires_at),
+        "jobs": [
+            {
+                **JobResponse.from_orm(j).dict(),
+                "views": stats.get(j.id, {}).get("page_view", 0),
+                "apply_clicks": stats.get(j.id, {}).get("apply_click", 0),
+            }
+            for j in jobs
+        ],
+    }
+
+
+@app.post("/api/employer/jobs", status_code=201)
+def employer_create_job(req: CreateJobRequest, invite: EmployerInvite = Depends(require_employer), db: Session = Depends(get_db)):
+    if not req.title or not req.title.strip():
+        raise HTTPException(status_code=400, detail="Job title is required")
+    # Company is always the invited company: the form can't post on behalf of someone else.
+    job = _job_from_request(req, source="employer", company=invite.company_name, employer_invite_id=invite.id)
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    logger.info(f"Employer job posted by {invite.company_name}: {job.id} - {job.title}")
+    return {"message": "Job published", "job": JobResponse.from_orm(job)}
+
+
+def _own_job_or_404(db: Session, invite: EmployerInvite, job_id: int) -> Job:
+    job = db.query(Job).filter(Job.id == job_id, Job.employer_invite_id == invite.id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@app.post("/api/employer/jobs/{job_id}/close")
+def employer_close_job(job_id: int, invite: EmployerInvite = Depends(require_employer), db: Session = Depends(get_db)):
+    job = _own_job_or_404(db, invite, job_id)
+    job.is_active = False
+    db.commit()
+    return {"message": "Job closed", "job_id": job_id}
+
+
+@app.post("/api/employer/jobs/{job_id}/repost")
+def employer_repost_job(job_id: int, invite: EmployerInvite = Depends(require_employer), db: Session = Depends(get_db)):
+    job = _own_job_or_404(db, invite, job_id)
+    deadline_cleared = _repost_job_row(job)
+    db.commit()
+    logger.info(f"Employer {invite.company_name} reposted job {job_id} - {job.title}")
+    return {
+        "message": "Job reposted to the top of the listing" + (" and its expired deadline cleared" if deadline_cleared else ""),
+        "job_id": job_id,
+        "deadline_cleared": deadline_cleared,
+    }
+
+
+@app.delete("/api/employer/jobs/{job_id}")
+def employer_delete_job(job_id: int, invite: EmployerInvite = Depends(require_employer), db: Session = Depends(get_db)):
+    job = _own_job_or_404(db, invite, job_id)
+    title = job.title
+    _delete_job_row(db, job)
+    db.commit()
+    logger.info(f"Employer {invite.company_name} deleted job {job_id} - {title}")
+    return {"message": "Job deleted", "job_id": job_id}
+
+
+# --- Link previews for shared jobs -------------------------------------------
+# The site is a single-page app, and the crawlers behind WhatsApp, Facebook,
+# LinkedIn, X and Slack do not run JavaScript, so a shared /jobs/<id> link
+# would only ever show the generic site card. This endpoint renders the job's
+# own Open Graph / Twitter tags (plus schema.org JobPosting) as plain HTML.
+# The web server routes crawler requests for /jobs/<id> here (see deploy/),
+# and a human who lands here is bounced straight to the real page.
+
+OG_IMAGE_PATH = "/og-image.jpg"
+SHARE_DESCRIPTION_CHARS = 200
+SITE_TAGLINE = "Find the latest jobs in Kenya. Verified opportunities from top companies with direct apply links."
+
+
+def _plain_text(value: Optional[str]) -> str:
+    text = html_lib.unescape(re.sub(r"<[^>]+>", " ", value or ""))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return (cut or text[:limit]).rstrip(",.;:") + "\u2026"
+
+
+def _share_summary(job: Job) -> str:
+    """One-line context then the description, sized for preview cards."""
+    bits = [b for b in (job.location, job.job_type) if b]
+    if job.application_deadline:
+        bits.append(f"Deadline {job.application_deadline.strftime('%d %b %Y')}")
+    lead = " \u00b7 ".join(bits)
+    body = _plain_text(job.description) or "View the full job details and apply directly on Annex Careers."
+    text = f"{lead}. {body}" if lead else body
+    return _truncate(text, SHARE_DESCRIPTION_CHARS)
+
+
+def _job_posting_jsonld(job: Job, job_url: str) -> dict:
+    data = {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        "title": job.title,
+        "description": _plain_text(job.description) or job.title,
+        "url": job_url,
+        "identifier": {"@type": "PropertyValue", "name": "Annex Careers", "value": str(job.id)},
+        "hiringOrganization": {"@type": "Organization", "name": job.company or "Company not listed"},
+        "directApply": False,
+    }
+    if job.posted_date:
+        data["datePosted"] = job.posted_date.date().isoformat()
+    if job.application_deadline:
+        data["validThrough"] = job.application_deadline.isoformat()
+    if job.job_type:
+        data["employmentType"] = job.job_type.upper().replace("-", "_").replace(" ", "_")
+    if job.remote:
+        data["jobLocationType"] = "TELECOMMUTE"
+    if job.location:
+        address = {"@type": "PostalAddress", "addressLocality": job.location}
+        if re.search(r"kenya|nairobi|mombasa|kisumu|nakuru|eldoret", job.location, re.I):
+            address["addressCountry"] = "KE"
+        data["jobLocation"] = {"@type": "Place", "address": address}
+    if job.salary_min or job.salary_max:
+        data["baseSalary"] = {
+            "@type": "MonetaryAmount",
+            "currency": job.salary_currency or "KES",
+            "value": {"@type": "QuantitativeValue", "minValue": job.salary_min, "maxValue": job.salary_max, "unitText": "MONTH"},
+        }
+    return data
+
+
+def _render_share_page(title: str, description: str, page_url: str, image_url: str,
+                       jsonld: Optional[dict] = None, og_type: str = "website") -> str:
+    e = html_lib.escape
+    page_title = f"{title} | Annex Careers" if title != "Annex Careers" else "Annex Careers - Find Jobs in Kenya"
+    # Escape "<" inside the JSON so no tag-like text (let alone "</script>")
+    # can appear in the script block; JSON parsers read \u003c as "<".
+    jsonld_tag = (
+        f'<script type="application/ld+json">{json.dumps(jsonld, ensure_ascii=False).replace("<", "\\u003c")}</script>'
+        if jsonld else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{e(page_title)}</title>
+<meta name="description" content="{e(description)}">
+<link rel="canonical" href="{e(page_url)}">
+<link rel="icon" href="{e(SITE_URL)}/favicon.ico">
+<meta property="og:type" content="{e(og_type)}">
+<meta property="og:site_name" content="Annex Careers">
+<meta property="og:locale" content="en_KE">
+<meta property="og:title" content="{e(title)}">
+<meta property="og:description" content="{e(description)}">
+<meta property="og:url" content="{e(page_url)}">
+<meta property="og:image" content="{e(image_url)}">
+<meta property="og:image:secure_url" content="{e(image_url)}">
+<meta property="og:image:type" content="image/jpeg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Annex Careers - Jobs in Kenya">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:site" content="@gregorytechKE">
+<meta name="twitter:title" content="{e(title)}">
+<meta name="twitter:description" content="{e(description)}">
+<meta name="twitter:image" content="{e(image_url)}">
+{jsonld_tag}
+<meta http-equiv="refresh" content="0; url={e(page_url)}">
+<script>window.location.replace({json.dumps(page_url)});</script>
+</head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:32px;color:#111827">
+<h1 style="font-size:20px;margin:0 0 8px">{e(title)}</h1>
+<p style="color:#6b7280;margin:0 0 16px">{e(description)}</p>
+<p><a href="{e(page_url)}" style="color:#dc2626">Continue to Annex Careers</a></p>
+</body>
+</html>"""
+
+
+@app.get("/share/jobs/{job_id}", response_class=HTMLResponse)
+def share_job_page(job_id: int, db: Session = Depends(get_db)):
+    site = SITE_URL.rstrip("/")
+    image_url = f"{site}{OG_IMAGE_PATH}"
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        html = _render_share_page("Annex Careers", SITE_TAGLINE, f"{site}/jobs", image_url)
+        return HTMLResponse(html, status_code=404, headers={"Cache-Control": "public, max-age=300"})
+
+    job_url = f"{site}/jobs/{job.id}"
+    title = f"{job.title} at {job.company}" if job.company else job.title
+    html = _render_share_page(
+        title, _share_summary(job), job_url, image_url,
+        jsonld=_job_posting_jsonld(job, job_url), og_type="article",
+    )
+    return HTMLResponse(html, headers={"Cache-Control": "public, max-age=600"})
+
+
+# --- Admin: automatic job-alert emails ---------------------------------------
+
+@app.get("/api/admin/alerts/status")
+def admin_alerts_status(_admin=Depends(require_admin)):
+    job = scheduler.get_job("daily_job_alerts") if scheduler.running else None
+    with _alerts_lock:
+        state = dict(_alerts_state)
+    return {
+        "hour_utc": settings.JOB_ALERT_HOUR_UTC,
+        "next_run": str(job.next_run_time) if job and job.next_run_time else None,
+        "running": state["running"],
+        "last_run_at": _iso_utc(state["last_run_at"]),
+        "last_summary": state["last_summary"],
+        "last_error": state["last_error"],
+        "email_configured": _email_provider_configured(),
+    }
+
+
+@app.post("/api/admin/alerts/run", status_code=202)
+def admin_alerts_run_now(_admin=Depends(require_admin)):
+    """Run the automatic alert pipeline immediately, in the background."""
+    with _alerts_lock:
+        if _alerts_state["running"]:
+            raise HTTPException(status_code=409, detail="Job alerts are already being sent")
+    threading.Thread(target=scheduled_job_alerts, name="job-alerts", daemon=True).start()
+    return {"message": "Job alert emails started", "started": True}

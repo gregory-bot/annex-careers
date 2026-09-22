@@ -9,7 +9,7 @@ from typing import Optional
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from airflow_home.database.connection import SessionLocal, init_db
-from airflow_home.database.models import Job, ScrapeLog
+from airflow_home.database.models import Job, ScrapeLog, JobSource
 
 # ----- Existing scrapers -----
 from airflow_home.scrapers.linkedin_scraper import LinkedInScraper
@@ -53,6 +53,12 @@ from airflow_home.scrapers.openedcareer_scraper import OpenedCareerScraper
 
 # ----- KEMRI e-recruitment -----
 from airflow_home.scrapers.kemri_scraper import KEMRIScraper
+
+# ----- Contracts / consultancies -----
+from airflow_home.scrapers.reliefweb_scraper import ReliefWebScraper
+
+# ----- Admin-configured sources (generic scraper) -----
+from airflow_home.scrapers.generic_site_scraper import GenericSiteScraper
 
 from airflow_home.transformers.cleaner import clean_jobs
 
@@ -99,7 +105,54 @@ SCRAPER_REGISTRY = {
     "openedcareer": OpenedCareerScraper,
     # --- KEMRI e-recruitment portal ---
     "kemri": KEMRIScraper,
+    # --- Contracts / consultancies (UN agencies, INGOs, NGOs) ---
+    "reliefweb": ReliefWebScraper,
 }
+
+
+# --- Admin-configured sources -------------------------------------------------
+# Rows in job_sources are scraped by GenericSiteScraper and take part in
+# run_all_scrapers() automatically, so a source added from the admin UI is
+# picked up by the next scheduled scrape without a deploy.
+
+def load_custom_sources(enabled_only: bool = True) -> list[dict]:
+    db = SessionLocal()
+    try:
+        query = db.query(JobSource)
+        if enabled_only:
+            query = query.filter(JobSource.enabled == True)
+        return [GenericSiteScraper.config_from_row(row) for row in query.order_by(JobSource.id).all()]
+    except Exception as e:
+        logger.warning(f"Could not load custom job sources: {e}")
+        return []
+    finally:
+        db.close()
+
+
+def get_custom_source(slug: str) -> Optional[dict]:
+    db = SessionLocal()
+    try:
+        row = db.query(JobSource).filter(JobSource.slug == slug).first()
+        return GenericSiteScraper.config_from_row(row) if row else None
+    except Exception as e:
+        logger.warning(f"Could not look up custom job source {slug!r}: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def is_known_source(source: str) -> bool:
+    return source in SCRAPER_REGISTRY or get_custom_source(source) is not None
+
+
+def build_scraper(source: str):
+    """Instantiate the scraper for a built-in registry key or a custom slug."""
+    if source in SCRAPER_REGISTRY:
+        return SCRAPER_REGISTRY[source]()
+    config = get_custom_source(source)
+    if config is None:
+        raise ValueError(f"Unknown source: {source}. Available: {list(SCRAPER_REGISTRY.keys())} plus custom sources")
+    return GenericSiteScraper(config)
 
 
 def run_scraper(
@@ -112,11 +165,7 @@ def run_scraper(
     Run a single scraper, clean data, and store in DB.
     Returns a summary dict.
     """
-    if source not in SCRAPER_REGISTRY:
-        raise ValueError(f"Unknown source: {source}. Available: {list(SCRAPER_REGISTRY.keys())}")
-
-    scraper_class = SCRAPER_REGISTRY[source]
-    scraper = scraper_class()
+    scraper = build_scraper(source)
 
     db = SessionLocal()
     log = ScrapeLog(source=source, status="running", started_at=datetime.datetime.now(datetime.UTC))
@@ -132,14 +181,35 @@ def run_scraper(
         cleaned_jobs = clean_jobs(raw_jobs)
 
         # 3. Store in DB with upsert (insert or update on conflict)
+        job_dicts = [job_data.to_dict() for job_data in cleaned_jobs]
+
+        # Work out which (source, external_id) pairs already exist BEFORE
+        # upserting. The upsert alone can't tell us: rowcount is 1 whether
+        # the row was inserted or updated, which is why "New" always read 0.
+        incoming_ids = {jd["external_id"] for jd in job_dicts if jd.get("external_id") and jd.get("source")}
+        known_keys = set()
+        if incoming_ids:
+            rows = (
+                db.query(Job.source, Job.external_id)
+                .filter(Job.external_id.in_(incoming_ids))
+                .all()
+            )
+            known_keys = {(src, ext) for src, ext in rows}
+
         new_count = 0
         updated_count = 0
-        for job_data in cleaned_jobs:
-            job_dict = job_data.to_dict()
+        for job_dict in job_dicts:
             job_dict["scraped_at"] = datetime.datetime.now(datetime.UTC)
             job_dict["is_active"] = True
 
             if job_dict.get("external_id") and job_dict.get("source"):
+                key = (job_dict["source"], job_dict["external_id"])
+                if key in known_keys:
+                    updated_count += 1
+                else:
+                    new_count += 1
+                    known_keys.add(key)  # a duplicate later in this batch is an update
+
                 # Upsert based on source + external_id
                 stmt = pg_insert(Job).values(**job_dict)
                 stmt = stmt.on_conflict_do_update(
@@ -156,13 +226,15 @@ def run_scraper(
                         "apply_url": stmt.excluded.apply_url,
                         "tags": stmt.excluded.tags,
                         "application_deadline": stmt.excluded.application_deadline,
+                        "kind": stmt.excluded.kind,
+                        "tor_url": stmt.excluded.tor_url,
+                        "duration": stmt.excluded.duration,
+                        "budget": stmt.excluded.budget,
                         "scraped_at": stmt.excluded.scraped_at,
                         "is_active": True,
                     },
                 )
-                result = db.execute(stmt)
-                if result.rowcount:
-                    updated_count += 1
+                db.execute(stmt)
             else:
                 # No external_id - just insert
                 db.add(Job(**job_dict))
@@ -206,10 +278,14 @@ def run_all_scrapers(
     max_pages: int = 5,
     sources: Optional[list[str]] = None,
 ) -> list[dict]:
-    """Run all scrapers (or specified ones) and return summaries."""
+    """Run all scrapers (or specified ones) and return summaries.
+    With no explicit list this covers every built-in scraper plus every
+    enabled admin-configured source."""
     init_db()
 
-    target_sources = sources or list(SCRAPER_REGISTRY.keys())
+    target_sources = sources or (
+        list(SCRAPER_REGISTRY.keys()) + [cfg["slug"] for cfg in load_custom_sources()]
+    )
     results = []
     for source in target_sources:
         try:

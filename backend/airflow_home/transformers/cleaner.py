@@ -64,6 +64,39 @@ def normalize_experience_level(raw: Optional[str]) -> Optional[str]:
     return raw_lower
 
 
+# Consultancies, TOR-based assignments and tenders are listed under
+# "Contracts" rather than "Jobs". Titles are decisive, but "consultant" on its
+# own is not: banks and agencies use it for ordinary sales and service roles
+# ("Consultant, Client Services", "Recruitment Consultant"). Descriptions only
+# count when they use the vocabulary of a procurement / consultancy notice.
+CONTRACT_TITLE_HINTS = re.compile(
+    r"\b(consultanc(?:y|ies)|terms? of reference|TORs?|tenders?|"
+    r"request for (?:proposals?|quotations?)|RF[PQ]s?|expressions? of interest|EOIs?|"
+    r"individual contractors?|(?:national|international|individual|independent|external|lead) consultants?|"
+    r"short[- ]term (?:assignment|contract|consultancy|expert)|"
+    r"call for (?:proposals|consultants|experts|applications)|procurement notice)\b",
+    re.I,
+)
+CONTRACT_DESC_HINTS = re.compile(
+    r"\b(terms of reference|request for proposals?|expressions? of interest|"
+    r"this consultancy|the consultancy|duration of the (?:consultancy|assignment)|scope of (?:work|the consultancy)|"
+    r"key deliverables|deliverables and timelines?)\b",
+    re.I,
+)
+
+
+def classify_kind(title: Optional[str], description: Optional[str] = None, current: Optional[str] = "job") -> str:
+    """'contract' for consultancy/TOR/tender notices, otherwise 'job'.
+    A source explicitly configured as contracts stays 'contract'."""
+    if current == "contract":
+        return "contract"
+    if title and CONTRACT_TITLE_HINTS.search(title):
+        return "contract"
+    if description and CONTRACT_DESC_HINTS.search(description[:1500]):
+        return "contract"
+    return "job"
+
+
 def detect_remote(job: JobData) -> bool:
     """Detect if a job is remote based on title, location, description, job_type."""
     search_text = " ".join(
@@ -122,6 +155,9 @@ def clean_job(job: JobData) -> JobData:
     # Detect remote
     if not job.remote:
         job.remote = detect_remote(job)
+
+    # Jobs vs contracts (consultancies, TORs, tenders)
+    job.kind = classify_kind(job.title, job.description, getattr(job, "kind", "job"))
 
     # Normalize salary currency
     job = normalize_salary_currency(job)

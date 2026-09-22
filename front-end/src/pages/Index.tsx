@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
 import Layout from "@/components/Layout";
+import { useDocumentMeta } from "@/lib/seo";
 import Hero from "@/components/Hero";
 import JobCard from "@/components/JobCard";
 import { useJobs, useStats, useCategories, useLocations } from "@/lib/jobStore";
@@ -24,6 +25,7 @@ function CardSkeleton() {
 }
 
 const Index = () => {
+  useDocumentMeta({ title: "Annex Careers - Find Jobs in Kenya" });
   const { jobs: featuredJobs, isLoading: featuredLoading, data: featuredPage } = useJobs({ page: 1, perPage: 6 });
   const { stats: apiStats } = useStats();
   const { categories: rawCategories, isLoading: categoriesLoading } = useCategories(8);

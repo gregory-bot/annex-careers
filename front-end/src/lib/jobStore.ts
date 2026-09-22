@@ -16,11 +16,20 @@ export interface Job {
   application_deadline: string;
   is_active: boolean;
   remote: boolean;
+  scraped_at: string;
+  /** "job" (default) or "contract": consultancies, TOR-based assignments, tenders. */
+  kind: "job" | "contract";
+  tor_url: string;
+  duration: string;
+  budget: string;
 }
+
+export type ListingKind = "job" | "contract";
 
 export interface Stats {
   total_jobs: number;
   active_jobs: number;
+  active_contracts?: number;
   remote_jobs: number;
   job_type_counts: Record<string, number>;
   companies: number;
@@ -51,6 +60,10 @@ import { useQuery, keepPreviousData, type UseQueryResult } from "@tanstack/react
 export const API_BASE = import.meta.env.VITE_API_URL ?? "https://api.careers.annex-technologies.com";
 
 // --- Admin auth ---
+
+async function readError(res: Response, fallback: string) {
+  return (await res.json().catch(() => ({}))).detail || fallback;
+}
 
 const ADMIN_TOKEN_KEY = "annex_admin_token";
 
@@ -119,6 +132,11 @@ function mapJob(j: any): Job {
     application_deadline: j.application_deadline ?? "",
     is_active: j.is_active ?? true,
     remote: j.remote ?? false,
+    scraped_at: j.scraped_at ?? "",
+    kind: j.kind === "contract" ? "contract" : "job",
+    tor_url: j.tor_url ?? "",
+    duration: j.duration ?? "",
+    budget: j.budget ?? "",
   };
 }
 
@@ -129,6 +147,8 @@ export interface JobsQueryParams {
   location?: string;
   jobType?: string;
   remote?: boolean;
+  /** Defaults to "job" on the server; pass "contract" for the Contracts page. */
+  kind?: ListingKind | "all";
   sortBy?: "scraped_at" | "posted_date" | "title" | "company" | "salary_min";
   sortOrder?: "asc" | "desc";
 }
@@ -153,6 +173,7 @@ async function fetchJobsPage(params: JobsQueryParams): Promise<JobsPage> {
   if (params.location) qs.set("location", params.location);
   if (params.jobType) qs.set("job_type", params.jobType);
   if (params.remote !== undefined) qs.set("remote", String(params.remote));
+  if (params.kind) qs.set("kind", params.kind);
   if (params.sortBy) qs.set("sort_by", params.sortBy);
   if (params.sortOrder) qs.set("sort_order", params.sortOrder);
 
@@ -290,16 +311,228 @@ export interface UserEntry {
   last_emailed_at: string | null;
 }
 
-export function useScrapeLogsAdmin() {
+export interface ScrapeLogsPage {
+  logs: ScrapeLogEntry[];
+  total: number;
+  page: number;
+  pages: number;
+  perPage: number;
+  inProgress: boolean;
+  runningSources: string[];
+}
+
+/** A "running" row older than this is a crashed run, not a live one. */
+const SCRAPE_RUNNING_STALE_MS = 2 * 60 * 60 * 1000;
+
+/** Paginated scrape history. Polls while any scrape is in progress so rows
+ * appear as each source finishes. */
+export function useScrapeLogsAdmin(page = 1, perPage = 10, source?: string) {
   const query = useQuery({
-    queryKey: ["admin", "scrape-logs"],
-    queryFn: async () => {
-      const res = await adminFetch(`/api/scrape-logs?limit=100`);
+    queryKey: ["admin", "scrape-logs", page, perPage, source ?? null],
+    queryFn: async (): Promise<ScrapeLogsPage> => {
+      const qs = new URLSearchParams({ page: String(page), per_page: String(perPage) });
+      if (source) qs.set("source", source);
+      const res = await adminFetch(`/api/scrape-logs?${qs.toString()}`);
+      if (!res.ok) throw new Error("Failed to load scrape logs");
       const data = await res.json();
-      return (data.logs ?? []) as ScrapeLogEntry[];
+      const logs = (data.logs ?? []) as ScrapeLogEntry[];
+      // The server flag covers runs this API process started; the log scan
+      // also catches runs started elsewhere (the scheduler, another worker).
+      const recentlyRunning = logs.some(
+        (l) => l.status === "running" && l.started_at
+          && Date.now() - new Date(l.started_at).getTime() < SCRAPE_RUNNING_STALE_MS,
+      );
+      return {
+        logs,
+        total: data.total ?? logs.length,
+        page: data.page ?? page,
+        pages: data.pages ?? 1,
+        perPage: data.per_page ?? perPage,
+        inProgress: Boolean(data.in_progress) || recentlyRunning,
+        runningSources: data.running_sources ?? [],
+      };
+    },
+    placeholderData: keepPreviousData,
+    refetchInterval: (q) => (q.state.data?.inProgress ? 5000 : false),
+  });
+  return {
+    logs: query.data?.logs ?? [],
+    total: query.data?.total ?? 0,
+    pages: query.data?.pages ?? 1,
+    inProgress: query.data?.inProgress ?? false,
+    runningSources: query.data?.runningSources ?? [],
+    loading: query.isLoading,
+    fetching: query.isFetching,
+    refresh: () => query.refetch(),
+  };
+}
+
+/** The API's built-in scheduler: tells the admin when the next automatic
+ * scrape will run. */
+export function useSchedulerStatus() {
+  const query = useQuery({
+    queryKey: ["admin", "scheduler"],
+    queryFn: async (): Promise<{ running: boolean; nextRun: string | null }> => {
+      const res = await adminFetch("/api/scheduler");
+      if (!res.ok) throw new Error("Failed to load scheduler status");
+      const data = await res.json();
+      const daily = (data.jobs ?? []).find((j: { id: string }) => j.id === "daily_scrape");
+      // APScheduler prints "YYYY-MM-DD HH:MM:SS+00:00"; make it ISO for Date().
+      const nextRun = daily?.next_run ? String(daily.next_run).replace(" ", "T") : null;
+      return { running: Boolean(data.running), nextRun };
+    },
+    staleTime: 60_000,
+  });
+  return { running: query.data?.running ?? false, nextRun: query.data?.nextRun ?? null };
+}
+
+// --- Admin: automatic job-alert emails ---
+
+export interface AlertsStatus {
+  hour_utc: number;
+  next_run: string | null;
+  running: boolean;
+  last_run_at: string | null;
+  last_summary: { skipped: boolean; reason?: string; users: number; emailed: number; failed: number; jobs_sent: number } | null;
+  last_error: string | null;
+  email_configured: boolean;
+}
+
+export function useAlertsStatus() {
+  const query = useQuery({
+    queryKey: ["admin", "alerts"],
+    queryFn: async (): Promise<AlertsStatus> => {
+      const res = await adminFetch("/api/admin/alerts/status");
+      if (!res.ok) throw new Error(await readError(res, "Failed to load alert status"));
+      const data = await res.json();
+      return { ...data, next_run: data.next_run ? String(data.next_run).replace(" ", "T") : null };
+    },
+    refetchInterval: (q) => (q.state.data?.running ? 3000 : false),
+  });
+  return { status: query.data ?? null, loading: query.isLoading, refresh: () => query.refetch() };
+}
+
+export async function runAlertsNow(): Promise<{ message: string; started: boolean }> {
+  const res = await adminFetch("/api/admin/alerts/run", { method: "POST" });
+  if (!res.ok) throw new Error(await readError(res, "Failed to start job alerts"));
+  return res.json();
+}
+
+// --- Admin job sources ---
+
+export interface SourceLastRun {
+  status: string;
+  jobs_found: number;
+  jobs_new: number;
+  jobs_updated: number;
+  error_message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface BuiltinSource {
+  slug: string;
+  name: string;
+  type: "builtin";
+  last_run: SourceLastRun | null;
+}
+
+export interface JobSource {
+  id: number;
+  name: string;
+  slug: string;
+  type: "custom";
+  urls: string[];
+  link_pattern: string | null;
+  link_selector: string | null;
+  description_selector: string | null;
+  default_company: string | null;
+  default_location: string | null;
+  max_jobs: number;
+  enabled: boolean;
+  kind: ListingKind;
+  notes: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  last_run: SourceLastRun | null;
+}
+
+export interface JobSourceInput {
+  name: string;
+  slug?: string;
+  urls: string[];
+  link_pattern?: string;
+  link_selector?: string;
+  description_selector?: string;
+  default_company?: string;
+  default_location?: string;
+  max_jobs?: number;
+  enabled?: boolean;
+  kind?: ListingKind;
+  notes?: string;
+}
+
+export interface SourcesPayload {
+  builtin: BuiltinSource[];
+  custom: JobSource[];
+  running_sources: string[];
+  full_scrape_running: boolean;
+}
+
+export function useJobSourcesAdmin() {
+  const query = useQuery({
+    queryKey: ["admin", "sources"],
+    queryFn: async (): Promise<SourcesPayload> => {
+      const res = await adminFetch("/api/admin/sources");
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to load sources");
+      const data = await res.json();
+      return {
+        builtin: data.builtin ?? [],
+        custom: data.custom ?? [],
+        running_sources: data.running_sources ?? [],
+        full_scrape_running: Boolean(data.full_scrape_running),
+      };
+    },
+    // Poll while a per-source scrape is running so "last run" fills in.
+    refetchInterval: (q) => {
+      const d = q.state.data;
+      return d && (d.running_sources.length > 0 || d.full_scrape_running) ? 5000 : false;
     },
   });
-  return { logs: query.data ?? [], loading: query.isLoading, refresh: query.refetch };
+  return { data: query.data, loading: query.isLoading, refresh: () => query.refetch() };
+}
+
+export async function createJobSource(input: JobSourceInput): Promise<JobSource> {
+  const res = await adminFetch("/api/admin/sources", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await readError(res, "Failed to add source"));
+  return res.json();
+}
+
+export async function updateJobSource(id: number, input: JobSourceInput): Promise<JobSource> {
+  const res = await adminFetch(`/api/admin/sources/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await readError(res, "Failed to update source"));
+  return res.json();
+}
+
+export async function deleteJobSource(id: number): Promise<{ message: string; slug: string }> {
+  const res = await adminFetch(`/api/admin/sources/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(await readError(res, "Failed to delete source"));
+  return res.json();
+}
+
+/** Scrape one source (built-in or custom) in the background. */
+export async function runSourceScrape(slug: string): Promise<{ message: string; started: boolean; source: string }> {
+  const res = await adminFetch(`/api/admin/scrape/${encodeURIComponent(slug)}`, { method: "POST" });
+  if (!res.ok) throw new Error(await readError(res, "Failed to start scrape"));
+  return res.json();
 }
 
 export interface UsersPage {
@@ -333,8 +566,65 @@ export function useUsersAdmin(page = 1, perPage = 50, source?: string) {
     total: query.data?.total ?? 0,
     pages: query.data?.pages ?? 1,
     loading: query.isLoading,
-    refresh: query.refetch,
+    refresh: () => query.refetch(),
   };
+}
+
+// --- Admin job management ---
+
+export interface AdminJobsParams {
+  page?: number;
+  perPage?: number;
+  search?: string;
+  status?: "all" | "active" | "inactive";
+  kind?: "all" | ListingKind;
+  source?: string;
+}
+
+/** Every job in the database (no public-visibility filter), paginated and
+ * searched server-side so the admin table never downloads the whole set. */
+export function useAdminJobs(params: AdminJobsParams = {}) {
+  const query = useQuery({
+    queryKey: ["admin", "jobs", params],
+    queryFn: async (): Promise<JobsPage> => {
+      const qs = new URLSearchParams();
+      qs.set("page", String(params.page ?? 1));
+      qs.set("per_page", String(params.perPage ?? 10));
+      if (params.search) qs.set("search", params.search);
+      if (params.status && params.status !== "all") qs.set("status", params.status);
+      if (params.kind && params.kind !== "all") qs.set("kind", params.kind);
+      if (params.source) qs.set("source", params.source);
+      const res = await adminFetch(`/api/admin/jobs?${qs.toString()}`);
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to load jobs");
+      const data = await res.json();
+      return {
+        jobs: (data.jobs ?? []).map(mapJob),
+        total: data.total ?? 0,
+        page: data.page ?? params.page ?? 1,
+        pages: data.pages ?? 1,
+        perPage: data.per_page ?? params.perPage ?? 10,
+      };
+    },
+    placeholderData: keepPreviousData,
+  });
+  return {
+    ...query,
+    jobs: query.data?.jobs ?? [],
+    total: query.data?.total ?? 0,
+    pages: query.data?.pages ?? 1,
+  };
+}
+
+export async function deleteJob(id: string): Promise<{ message: string; job_id: number }> {
+  const res = await adminFetch(`/api/admin/jobs/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to delete job");
+  return res.json();
+}
+
+export async function repostJob(id: string): Promise<{ message: string; deadline_cleared: boolean }> {
+  const res = await adminFetch(`/api/admin/jobs/${id}/repost`, { method: "POST" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to repost job");
+  return res.json();
 }
 
 export function useAdminAnalytics() {
@@ -378,13 +668,15 @@ export async function sendBulkAlerts(userIds: number[]): Promise<{ sent: number 
   return res.json();
 }
 
-export async function triggerScrapeAll(): Promise<{ total_found: number }> {
+/** Starts a full scrape in the background; the API returns immediately and
+ * each source's result lands in the scrape logs as it finishes. */
+export async function triggerScrapeAll(): Promise<{ message: string; started: boolean; sources: number }> {
   const res = await adminFetch(`/api/scrape-all`, { method: "POST" });
-  if (!res.ok) throw new Error("Scrape failed");
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to start scrape");
   return res.json();
 }
 
-export async function createJob(data: {
+export interface JobInput {
   title: string;
   company?: string;
   location?: string;
@@ -396,13 +688,231 @@ export async function createJob(data: {
   apply_url?: string;
   tags?: string;
   application_deadline?: string;
-}): Promise<{ message: string; job_id: number }> {
+  kind?: ListingKind;
+  tor_url?: string;
+  duration?: string;
+  budget?: string;
+}
+
+export async function createJob(data: JobInput): Promise<{ message: string; job_id: number }> {
   const res = await adminFetch(`/api/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to create job");
+  return res.json();
+}
+
+// --- Employer portal (company side) ---
+// A company invited by the admin signs in with its email + access code and
+// gets a token that only works on /api/employer/* endpoints.
+
+const EMPLOYER_TOKEN_KEY = "annex_employer_token";
+
+export function getEmployerToken(): string | null {
+  try {
+    return sessionStorage.getItem(EMPLOYER_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function clearEmployerToken() {
+  try {
+    sessionStorage.removeItem(EMPLOYER_TOKEN_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+export interface EmployerSession {
+  company_name: string;
+  contact_name: string | null;
+}
+
+export async function employerLogin(email: string, accessCode: string): Promise<EmployerSession> {
+  const res = await fetch(`${API_BASE}/api/employer/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: email.trim(), access_code: accessCode.trim() }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Invalid email or access code");
+  const data = await res.json();
+  try {
+    sessionStorage.setItem(EMPLOYER_TOKEN_KEY, data.token);
+  } catch {
+    // ignore: the session just won't survive a reload
+  }
+  return { company_name: data.company_name, contact_name: data.contact_name ?? null };
+}
+
+export class EmployerSessionError extends Error {}
+
+async function employerFetch(path: string, options: RequestInit = {}): Promise<Response> {
+  const token = getEmployerToken();
+  const headers = new Headers(options.headers);
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  if (res.status === 401 || res.status === 403) {
+    clearEmployerToken();
+    throw new EmployerSessionError((await res.json().catch(() => ({}))).detail || "Your session has ended. Please sign in again.");
+  }
+  return res;
+}
+
+/** A job with the engagement the company cares about: page views and Apply Now clicks. */
+export interface EmployerJob extends Job {
+  views: number;
+  apply_clicks: number;
+}
+
+export interface EmployerMe {
+  company_name: string;
+  contact_name: string | null;
+  email: string;
+  expires_at: string | null;
+  jobs: EmployerJob[];
+}
+
+export function useEmployerMe(enabled: boolean) {
+  const query = useQuery({
+    queryKey: ["employer", "me"],
+    queryFn: async (): Promise<EmployerMe> => {
+      const res = await employerFetch("/api/employer/me");
+      if (!res.ok) throw new Error("Failed to load your details");
+      const data = await res.json();
+      const jobs: EmployerJob[] = (data.jobs ?? []).map((raw: { views?: number; apply_clicks?: number }) => ({
+        ...mapJob(raw),
+        views: raw.views ?? 0,
+        apply_clicks: raw.apply_clicks ?? 0,
+      }));
+      return { ...data, jobs };
+    },
+    enabled,
+    retry: false,
+  });
+  return { me: query.data ?? null, loading: query.isLoading, error: query.error, refresh: () => query.refetch() };
+}
+
+export async function createEmployerJob(data: JobInput): Promise<{ message: string; job: Job }> {
+  const res = await employerFetch("/api/employer/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to publish job");
+  const body = await res.json();
+  return { message: body.message, job: mapJob(body.job) };
+}
+
+export async function closeEmployerJob(id: string): Promise<{ message: string }> {
+  const res = await employerFetch(`/api/employer/jobs/${id}/close`, { method: "POST" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to close job");
+  return res.json();
+}
+
+export async function repostEmployerJob(id: string): Promise<{ message: string; deadline_cleared: boolean }> {
+  const res = await employerFetch(`/api/employer/jobs/${id}/repost`, { method: "POST" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to repost job");
+  return res.json();
+}
+
+export async function deleteEmployerJob(id: string): Promise<{ message: string }> {
+  const res = await employerFetch(`/api/employer/jobs/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to delete job");
+  return res.json();
+}
+
+// --- Admin: employer invites ---
+
+export interface EmployerInvite {
+  id: number;
+  company_name: string;
+  contact_name: string | null;
+  email: string;
+  status: "active" | "revoked";
+  expired: boolean;
+  note: string | null;
+  created_at: string | null;
+  expires_at: string | null;
+  email_sent_at: string | null;
+  last_login_at: string | null;
+  jobs_posted: number;
+}
+
+/** Returned once, right after an invite is created or its code is reissued. */
+export interface EmployerInviteIssued extends EmployerInvite {
+  access_code: string;
+  emailed: boolean;
+  email_error: string | null;
+  portal_url: string;
+}
+
+export interface EmployerInviteInput {
+  company_name: string;
+  email: string;
+  contact_name?: string;
+  note?: string;
+  expires_in_days?: number | null;
+  send_email?: boolean;
+}
+
+export function useEmployerInvitesAdmin() {
+  const query = useQuery({
+    queryKey: ["admin", "employers"],
+    queryFn: async () => {
+      const res = await adminFetch("/api/admin/employers");
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to load employers");
+      const data = await res.json();
+      return {
+        employers: (data.employers ?? []) as EmployerInvite[],
+        portalUrl: String(data.portal_url ?? ""),
+        emailConfigured: Boolean(data.email_configured),
+      };
+    },
+  });
+  return {
+    employers: query.data?.employers ?? [],
+    portalUrl: query.data?.portalUrl ?? "",
+    emailConfigured: query.data?.emailConfigured ?? false,
+    loading: query.isLoading,
+    refresh: () => query.refetch(),
+  };
+}
+
+export async function createEmployerInvite(input: EmployerInviteInput): Promise<EmployerInviteIssued> {
+  const res = await adminFetch("/api/admin/employers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await readError(res, "Failed to invite company"));
+  return res.json();
+}
+
+export async function resendEmployerInvite(id: number, sendEmail = true): Promise<EmployerInviteIssued> {
+  const res = await adminFetch(`/api/admin/employers/${id}/resend?send_email=${sendEmail}`, { method: "POST" });
+  if (!res.ok) throw new Error(await readError(res, "Failed to issue a new code"));
+  return res.json();
+}
+
+export async function updateEmployerInvite(
+  id: number,
+  patch: Partial<{ company_name: string; contact_name: string; email: string; note: string; status: "active" | "revoked"; expires_in_days: number }>,
+): Promise<EmployerInvite> {
+  const res = await adminFetch(`/api/admin/employers/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(await readError(res, "Failed to update invite"));
+  return res.json();
+}
+
+export async function deleteEmployerInvite(id: number): Promise<{ message: string }> {
+  const res = await adminFetch(`/api/admin/employers/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(await readError(res, "Failed to delete invite"));
   return res.json();
 }
 

@@ -37,6 +37,10 @@ class JobData:
         posted_date: Optional[datetime.datetime] = None,
         application_deadline: Optional[datetime.datetime] = None,
         external_id: Optional[str] = None,
+        kind: str = "job",
+        tor_url: Optional[str] = None,
+        duration: Optional[str] = None,
+        budget: Optional[str] = None,
     ):
         self.title = title
         self.source = source
@@ -56,6 +60,10 @@ class JobData:
         self.posted_date = posted_date
         self.application_deadline = application_deadline
         self.external_id = external_id
+        self.kind = kind or "job"  # "job" or "contract"
+        self.tor_url = tor_url
+        self.duration = duration
+        self.budget = budget
 
     def to_dict(self) -> dict:
         return {
@@ -77,6 +85,10 @@ class JobData:
             "posted_date": self.posted_date,
             "application_deadline": self.application_deadline,
             "external_id": self.external_id,
+            "kind": self.kind,
+            "tor_url": self.tor_url,
+            "duration": self.duration,
+            "budget": self.budget,
         }
 
 
@@ -94,6 +106,21 @@ class BaseScraper(ABC):
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     ]
 
+    @staticmethod
+    def _accept_encoding() -> str:
+        """Only advertise brotli when it can actually be decoded. Advertising
+        "br" without the brotli package made servers that prefer it return
+        bytes requests could not decode, so pages parsed as empty."""
+        try:
+            import brotli  # noqa: F401
+            return "gzip, deflate, br"
+        except ImportError:
+            try:
+                import brotlicffi  # noqa: F401
+                return "gzip, deflate, br"
+            except ImportError:
+                return "gzip, deflate"
+
     def __init__(self):
         import random
         self.session = requests.Session()
@@ -102,7 +129,7 @@ class BaseScraper(ABC):
                 "User-Agent": random.choice(self._USER_AGENTS),
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br",
+                "Accept-Encoding": self._accept_encoding(),
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
             }

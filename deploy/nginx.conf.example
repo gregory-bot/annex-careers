@@ -1,0 +1,42 @@
+# Front-end host for careers.annex-technologies.com (nginx).
+# See Caddyfile.example for the idea: link-preview crawlers asking for
+# /jobs/<id> are served the API's /share/jobs/<id> page (that job's Open
+# Graph tags); everyone else gets the single-page app.
+
+map $http_user_agent $is_link_bot {
+    default 0;
+    ~*(facebookexternalhit|facebot|whatsapp|twitterbot|linkedinbot|slackbot|telegrambot|discordbot|pinterestbot|skypeuripreview|embedly|redditbot|applebot|vkshare|quora\ link\ preview|outbrain|tumblr|bitlybot|nuzzel|xing-contenttabreceiver|mastodon|bluesky|w3c_validator) 1;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name careers.annex-technologies.com;
+    root /var/www/annex-careers/dist;
+    index index.html;
+
+    # ssl_certificate ...; ssl_certificate_key ...;
+
+    location ~ ^/jobs/(\d+)/?$ {
+        set $job_id $1;
+        if ($is_link_bot) {
+            rewrite ^ /__share/jobs/$job_id last;
+        }
+        try_files $uri /index.html;
+    }
+
+    location ~ ^/__share/jobs/(\d+)$ {
+        internal;
+        proxy_pass https://api.careers.annex-technologies.com/share/jobs/$1;
+        proxy_set_header Host api.careers.annex-technologies.com;
+        proxy_ssl_server_name on;
+    }
+
+    location ~* ^/(assets/|og-image\.jpg|favicon\.ico|favicon\.png|apple-touch-icon\.png) {
+        add_header Cache-Control "public, max-age=604800";
+        try_files $uri =404;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
