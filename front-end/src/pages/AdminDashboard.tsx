@@ -16,7 +16,7 @@ import {
   useScrapeLogsAdmin, useUsersAdmin, useAdminAnalytics, useSchedulerStatus,
   useJobSourcesAdmin, createJobSource, updateJobSource, deleteJobSource, runSourceScrape,
   useEmployerInvitesAdmin, createEmployerInvite, resendEmployerInvite, updateEmployerInvite, deleteEmployerInvite,
-  useAlertsStatus, runAlertsNow,
+  useAlertsStatus, runAlertsNow, uploadListingFile,
   sendBulkAlerts, triggerScrapeAll, createJob, deleteJob, repostJob,
   getAdminToken, clearAdminToken,
   type Job, type JobInput, type JobSource, type JobSourceInput, type SourceLastRun,
@@ -511,7 +511,7 @@ function AddJobTab() {
         <h2 className="font-heading font-bold text-lg">Add a Job or Contract Manually</h2>
         <p className="text-sm text-muted-foreground">Post an opening or a consultancy / tender you found elsewhere so users can discover and apply</p>
       </div>
-      <JobForm allowKindSwitch onSubmit={handleSubmit} />
+      <JobForm allowKindSwitch onSubmit={handleSubmit} uploader={(file) => uploadListingFile(file, "admin")} />
     </>
   );
 }
@@ -863,7 +863,7 @@ function EmployersTab() {
 
 // --- Email trigger ---
 
-const USERS_PER_PAGE = 100;
+const USERS_PER_PAGE = 10;
 
 function hourUtcToLocal(hourUtc: number) {
   const d = new Date();
@@ -1095,9 +1095,7 @@ function EmailTriggerTab() {
               </tbody>
             </table>
           </div>
-          {pages > 1 && (
-            <PaginationBar page={page} pages={pages} total={total} perPage={USERS_PER_PAGE} onPageChange={setPage} />
-          )}
+          <PaginationBar page={page} pages={pages} total={total} perPage={USERS_PER_PAGE} onPageChange={setPage} busy={loading} />
         </div>
       )}
     </>

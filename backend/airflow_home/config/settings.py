@@ -54,6 +54,9 @@ class Settings:
     # ── Automatic emails / integrations ─────────────────────────────────────
     JOB_ALERT_HOUR_UTC = int(os.getenv("JOB_ALERT_HOUR_UTC", "5"))  # 05:00 UTC = 08:00 EAT
     RELIEFWEB_APPNAME  = os.getenv("RELIEFWEB_APPNAME", "")  # free; request at https://apidoc.reliefweb.int/
+    # Public base URL of this API, used when the API must write absolute links to its own
+    # files (share-preview images, auto-filled TOR links). Falls back to the request's host.
+    API_PUBLIC_URL     = os.getenv("API_PUBLIC_URL", "")
 
     # ── Admin auth ───────────────────────────────────────────────────────────
     ADMIN_USERNAME       = os.getenv("ADMIN_USERNAME", "")

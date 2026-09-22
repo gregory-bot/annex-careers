@@ -13,7 +13,9 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     UniqueConstraint,
+    LargeBinary,
 )
+from sqlalchemy.orm import relationship, deferred
 from airflow_home.database.connection import Base
 
 
@@ -48,6 +50,10 @@ class Job(Base):
     tor_url = Column(String(1000), nullable=True)  # Terms of Reference / tender document
     duration = Column(String(120), nullable=True)  # e.g. "3 months", "20 working days"
     budget = Column(String(120), nullable=True)  # e.g. "KES 800,000", "USD 15,000 fixed fee"
+
+    # Poster images and TOR / contract documents uploaded with the listing.
+    attachments = relationship("Attachment", order_by="Attachment.id", lazy="select",
+                               cascade="all, delete-orphan", passive_deletes=True)
 
     __table_args__ = (
         Index("ix_jobs_source", "source"),
@@ -207,3 +213,33 @@ class EmployerInvite(Base):
 
     def __repr__(self):
         return f"<EmployerInvite(company='{self.company_name}', email='{self.email}', status='{self.status}')>"
+
+
+class Attachment(Base):
+    """A file attached to a listing: a poster image or a TOR / contract
+    document. Stored in the database (not on disk) so it survives redeploys
+    without a mounted volume; served by GET /api/files/{id}. Uploaded before
+    the listing exists, then linked when the listing is saved."""
+    __tablename__ = "attachments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=True)
+    filename = Column(String(300), nullable=False)
+    content_type = Column(String(120), nullable=False)
+    size = Column(Integer, nullable=False)
+    kind = Column(String(20), nullable=False)  # 'image' or 'document'
+    uploaded_by = Column(String(60), nullable=False)  # 'admin' or 'employer:<invite_id>'
+    extracted_text = Column(Text, nullable=True)  # OCR / document text, for pre-filling the form
+    data = deferred(Column(LargeBinary, nullable=False))  # loaded only when the file is served
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_attachments_job_id", "job_id"),
+    )
+
+    @property
+    def url(self) -> str:
+        return f"/api/files/{self.id}"
+
+    def __repr__(self):
+        return f"<Attachment(id={self.id}, job_id={self.job_id}, kind='{self.kind}', filename='{self.filename}')>"

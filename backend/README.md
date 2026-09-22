@@ -208,6 +208,28 @@ GET  /api/admin/alerts/status   schedule, next run, last run summary
 POST /api/admin/alerts/run      run the pipeline now (background)
 ```
 
+## Listing Attachments (posters, TORs, contract documents)
+
+Admins and signed-in employers can attach files to a listing: poster images
+(JPG/PNG/WEBP) and documents (PDF, .docx, .txt), up to 8 MB each. Files are
+stored in the `attachments` table (not on disk, so redeploys keep them) and
+served from `GET /api/files/{id}`.
+
+Upload happens before the listing is saved so the form can be pre-filled:
+`POST /api/uploads` stores the file, reads its text (OCR for images via
+RapidOCR in `api/ocr.py`; pdfplumber / python-docx for documents), and
+returns `suggested` fields from `api/listing_extract.py` (title, organisation,
+deadline, apply link, location, type, job/contract). The listing is then
+created with `attachment_ids`; a file can only be linked by the account that
+uploaded it. Contracts without a TOR link get their first document as the TOR.
+Posters are shown on the listing page and used as the share-preview image.
+Uploads never linked to a listing are purged after 24 hours.
+
+OCR needs `rapidocr-onnxruntime` (in requirements) and, in Docker, `libgl1`
+plus `libglib2.0-0` (in the Dockerfile). The engine is loaded in the
+background at startup. Set `API_PUBLIC_URL` in production so absolute file
+links use the public API host.
+
 ## Link Previews for Shared Jobs (SEO)
 
 The site is a single-page app; WhatsApp, Facebook, LinkedIn, X and Slack

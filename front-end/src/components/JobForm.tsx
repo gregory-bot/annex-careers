@@ -1,7 +1,10 @@
-import { useState } from "react";
-import { Loader2, PlusCircle, Briefcase, FileText } from "lucide-react";
+import { useRef, useState } from "react";
+import { Loader2, PlusCircle, Briefcase, FileText, Paperclip, X, ImageIcon, Sparkles } from "lucide-react";
 import { toast } from "sonner";
-import type { JobInput, ListingKind } from "@/lib/jobStore";
+import { fileUrl, type JobInput, type ListingKind, type UploadResult } from "@/lib/jobStore";
+
+const ACCEPTED_FILES = "image/jpeg,image/png,image/webp,.pdf,.docx,.txt";
+const MAX_FILE_MB = 8;
 
 export const jobInputClass =
   "w-full px-3 py-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary";
@@ -62,7 +65,7 @@ function toInput(form: FormState, kind: ListingKind, lockedCompany?: string): Jo
  */
 export default function JobForm({
   lockedCompany, initialKind = "job", allowKindSwitch = false,
-  submitLabel, submittingLabel, onSubmit,
+  submitLabel, submittingLabel, onSubmit, uploader,
 }: {
   lockedCompany?: string;
   initialKind?: ListingKind;
@@ -70,11 +73,77 @@ export default function JobForm({
   submitLabel?: string;
   submittingLabel?: string;
   onSubmit: (input: JobInput) => Promise<void>;
+  /** Uploads a poster / document and returns what could be read from it. Omit to hide attachments. */
+  uploader?: (file: File) => Promise<UploadResult>;
 }) {
   const [kind, setKind] = useState<ListingKind>(initialKind);
   const [form, setForm] = useState<FormState>(() => emptyForm(initialKind));
   const [submitting, setSubmitting] = useState(false);
+  const [attachments, setAttachments] = useState<UploadResult[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
   const isContract = kind === "contract";
+
+  /** Fill fields the person has not typed into yet from what was read out of the file. */
+  const applySuggestions = (result: UploadResult) => {
+    const s = result.suggested || {};
+    let filled = 0;
+    if (allowKindSwitch && s.kind && s.kind !== kind && !form.title.trim() && !form.description.trim()) {
+      switchKind(s.kind);
+    }
+    setForm((prev) => {
+      const next = { ...prev };
+      const fill = (field: keyof FormState, value?: string) => {
+        if (value && typeof next[field] === "string" && !(next[field] as string).trim()) {
+          (next as Record<string, string | boolean>)[field] = value;
+          filled += 1;
+        }
+      };
+      fill("title", s.title);
+      if (!lockedCompany) fill("company", s.company);
+      fill("location", s.location);
+      fill("apply_url", s.apply_url);
+      fill("application_deadline", s.application_deadline);
+      fill("description", s.description);
+      if (s.job_type && (s.kind === "contract" ? CONTRACT_TYPES : JOB_TYPES).includes(s.job_type)) fill("job_type", s.job_type);
+      return next;
+    });
+    return filled;
+  };
+
+  const handleFiles = async (files: FileList | null) => {
+    if (!files || !uploader) return;
+    setUploading(true);
+    try {
+      for (const file of Array.from(files)) {
+        if (file.size > MAX_FILE_MB * 1024 * 1024) {
+          toast.error(`${file.name} is larger than ${MAX_FILE_MB} MB`);
+          continue;
+        }
+        try {
+          const result = await uploader(file);
+          setAttachments((prev) => [...prev, result]);
+          if (result.read) {
+            const filled = applySuggestions(result);
+            toast.success(filled > 0
+              ? `Read ${file.name} and filled ${filled} field${filled === 1 ? "" : "s"}. Please check them before publishing.`
+              : `Attached ${file.name}. Its text is in the description if you need it.`);
+          } else if (result.kind === "image" && !result.ocr_available) {
+            toast.success(`Attached ${file.name}. Text reading is not enabled on the server, so fill the form manually.`);
+          } else {
+            toast.success(`Attached ${file.name}. No readable text was found, so fill the form manually.`);
+          }
+        } catch (err) {
+          toast.error(err instanceof Error && err.message ? err.message : `Could not upload ${file.name}`);
+        }
+      }
+    } finally {
+      setUploading(false);
+      if (fileInput.current) fileInput.current.value = "";
+    }
+  };
+
+  const removeAttachment = (id: number) => setAttachments((prev) => prev.filter((a) => a.id !== id));
 
   const update = (field: keyof FormState, value: string | boolean) =>
     setForm((prev) => ({ ...prev, [field]: value }));
@@ -94,8 +163,9 @@ export default function JobForm({
     }
     setSubmitting(true);
     try {
-      await onSubmit(toInput(form, kind, lockedCompany));
+      await onSubmit({ ...toInput(form, kind, lockedCompany), attachment_ids: attachments.map((a) => a.id) });
       setForm(emptyForm(kind));
+      setAttachments([]);
     } catch (err) {
       toast.error(err instanceof Error && err.message ? err.message : "Failed to save");
     } finally {
@@ -132,6 +202,47 @@ export default function JobForm({
               ? "A short-term assignment, consultancy or tender. Share the terms of reference, duration and budget; it is listed under Contracts."
               : "A permanent, part-time, internship or similar opening; it is listed under Jobs."}
           </p>
+        </div>
+      )}
+
+      {uploader && (
+        <div className="mb-6 rounded-xl border border-dashed border-border bg-muted/40 p-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium flex items-center gap-2"><Sparkles size={15} className="text-primary" /> Have a poster, TOR or contract document?</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Attach it and we read the text to pre-fill the form. Images, PDF, Word or text, up to {MAX_FILE_MB} MB. Images are shown on the listing; documents can be downloaded from it.
+              </p>
+            </div>
+            <div>
+              <input ref={fileInput} type="file" accept={ACCEPTED_FILES} multiple className="hidden" onChange={(e) => handleFiles(e.target.files)} />
+              <button type="button" onClick={() => fileInput.current?.click()} disabled={uploading} className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-input bg-card text-sm font-medium hover:bg-muted disabled:opacity-50 whitespace-nowrap">
+                {uploading ? <Loader2 size={15} className="animate-spin" /> : <Paperclip size={15} />}
+                {uploading ? "Reading file..." : "Attach file"}
+              </button>
+            </div>
+          </div>
+          {attachments.length > 0 && (
+            <ul className="mt-4 flex flex-wrap gap-3">
+              {attachments.map((a) => (
+                <li key={a.id} className="relative flex items-center gap-3 bg-card border border-border rounded-lg p-2 pr-8 max-w-full">
+                  {a.kind === "image" ? (
+                    <img src={fileUrl(a.url)} alt={a.filename} className="w-14 h-14 rounded-md object-cover border border-border" />
+                  ) : (
+                    <div className="w-14 h-14 rounded-md bg-orange-50 text-orange-700 flex items-center justify-center border border-orange-200"><FileText size={22} /></div>
+                  )}
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium truncate max-w-[200px]" title={a.filename}>{a.filename}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {a.kind === "image" ? <span className="inline-flex items-center gap-1"><ImageIcon size={11} /> Poster</span> : "Document"} {"\u00b7"} {(a.size / 1024).toFixed(0)} KB
+                      {a.read ? " \u00b7 text read" : ""}
+                    </p>
+                  </div>
+                  <button type="button" onClick={() => removeAttachment(a.id)} className="absolute top-1.5 right-1.5 p-1 rounded hover:bg-muted" aria-label={`Remove ${a.filename}`}><X size={13} /></button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 

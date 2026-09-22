@@ -3,7 +3,7 @@ import { useEffect } from "react";
 import { ArrowLeft, MapPin, Briefcase, Clock, ExternalLink, Share2, CalendarClock, Building2, Loader2, FileCheck, FileText, Hourglass, Wallet } from "lucide-react";
 import Layout from "@/components/Layout";
 import JobCard from "@/components/JobCard";
-import { useJob, useAllJobs, trackAnalyticsEvent } from "@/lib/jobStore";
+import { useJob, useAllJobs, trackAnalyticsEvent, fileUrl } from "@/lib/jobStore";
 import { useDocumentMeta, excerpt } from "@/lib/seo";
 import { toast } from "sonner";
 
@@ -144,6 +144,9 @@ const JobDetails = () => {
 
   const applyLink = job.apply_url || job.url || "#";
   const isContract = job.kind === "contract";
+  const posters = job.attachments.filter((a) => a.kind === "image");
+  const documents = job.attachments.filter((a) => a.kind === "document");
+  const torHref = job.tor_url || (isContract && documents[0] ? fileUrl(documents[0].url) : "");
   const hasDescription = job.description && job.description.trim().length > 0;
   const hasRequirements = job.requirements && job.requirements.length > 0;
 
@@ -199,6 +202,16 @@ const JobDetails = () => {
                 </div>
 
                 {job.salary && <p className="font-heading text-lg sm:text-xl font-bold text-primary mb-4 sm:mb-6">{job.salary}</p>}
+
+                {posters.length > 0 && (
+                  <div className="mb-6 space-y-3">
+                    {posters.map((a) => (
+                      <a key={a.id} href={fileUrl(a.url)} target="_blank" rel="noopener noreferrer" className="block" title="Open full size">
+                        <img src={fileUrl(a.url)} alt={`${job.title} poster`} loading="lazy" className="w-full max-h-[640px] object-contain rounded-xl border border-border bg-muted" />
+                      </a>
+                    ))}
+                  </div>
+                )}
 
                 <h2 className="font-heading font-semibold text-base sm:text-lg mb-3">{isContract ? "Scope of Work / Terms of Reference" : "Description"}</h2>
                 {hasDescription ? (
@@ -271,9 +284,9 @@ const JobDetails = () => {
                     Application link not available
                   </div>
                 )}
-                {isContract && job.tor_url && (
+                {isContract && torHref && (
                   <a
-                    href={job.tor_url}
+                    href={torHref}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="w-full flex items-center justify-center gap-2 px-6 py-3 border border-orange-300 text-orange-700 bg-orange-50 rounded-xl font-medium text-sm hover:bg-orange-100 transition-colors"
@@ -281,6 +294,18 @@ const JobDetails = () => {
                     <FileText size={16} /> View Terms of Reference
                   </a>
                 )}
+                {documents.filter((d) => fileUrl(d.url) !== torHref).map((d) => (
+                  <a
+                    key={d.id}
+                    href={fileUrl(d.url)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full flex items-center justify-center gap-2 px-6 py-3 border border-border rounded-xl font-medium text-sm hover:bg-muted transition-colors"
+                    title={d.filename}
+                  >
+                    <FileText size={16} /> <span className="truncate">{d.filename}</span>
+                  </a>
+                ))}
                 <button
                   onClick={handleShare}
                   className="w-full flex items-center justify-center gap-2 px-6 py-3 border border-border rounded-xl font-medium text-sm hover:bg-muted transition-colors"

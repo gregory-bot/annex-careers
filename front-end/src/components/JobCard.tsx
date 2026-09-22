@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
 import { MapPin, Clock, CalendarClock, Building2, DollarSign, FileText, Hourglass } from "lucide-react";
-import type { Job } from "@/lib/jobStore";
+import { fileUrl, type Job } from "@/lib/jobStore";
 
 function formatDeadline(deadline: string): string {
   if (!deadline) return "";
@@ -41,6 +41,7 @@ const JobCard = ({ job }: { job: Job }) => {
     : "";
   const jobType = job.type?.toLowerCase().trim() || "";
   const isContract = job.kind === "contract";
+  const poster = job.attachments?.find((a) => a.kind === "image");
 
   return (
     <Link
@@ -49,9 +50,13 @@ const JobCard = ({ job }: { job: Job }) => {
     >
       {/* Header: logo + badges */}
       <div className="flex items-start justify-between mb-4 gap-2">
-        <div className="w-11 h-11 rounded-xl bg-primary/10 text-primary font-heading font-bold flex items-center justify-center text-sm shrink-0">
-          {initials || <Building2 size={18} />}
-        </div>
+        {poster ? (
+          <img src={fileUrl(poster.url)} alt="" loading="lazy" className="w-11 h-11 rounded-xl object-cover border border-border shrink-0" />
+        ) : (
+          <div className="w-11 h-11 rounded-xl bg-primary/10 text-primary font-heading font-bold flex items-center justify-center text-sm shrink-0">
+            {initials || <Building2 size={18} />}
+          </div>
+        )}
         <div className="flex flex-wrap gap-1 justify-end">
           {isRemote && (
             <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">

@@ -22,9 +22,20 @@ export interface Job {
   tor_url: string;
   duration: string;
   budget: string;
+  attachments: Attachment[];
 }
 
 export type ListingKind = "job" | "contract";
+
+/** A poster image or TOR / contract document attached to a listing. `url` is API-relative; use fileUrl(). */
+export interface Attachment {
+  id: number;
+  url: string;
+  filename: string;
+  content_type: string;
+  size: number;
+  kind: "image" | "document";
+}
 
 export interface Stats {
   total_jobs: number;
@@ -137,7 +148,13 @@ function mapJob(j: any): Job {
     tor_url: j.tor_url ?? "",
     duration: j.duration ?? "",
     budget: j.budget ?? "",
+    attachments: Array.isArray(j.attachments) ? j.attachments : [],
   };
+}
+
+/** Absolute URL for an API-served file such as an attachment. */
+export function fileUrl(path: string): string {
+  return /^https?:\/\//i.test(path) ? path : `${API_BASE}${path}`;
 }
 
 export interface JobsQueryParams {
@@ -692,6 +709,31 @@ export interface JobInput {
   tor_url?: string;
   duration?: string;
   budget?: string;
+  /** Files uploaded via uploadListingFile() before saving; linked to the listing on create. */
+  attachment_ids?: number[];
+}
+
+/** Result of uploading a poster / document: the stored file plus what we could read from it. */
+export interface UploadResult extends Attachment {
+  extracted_text: string;
+  read: boolean;
+  ocr_available: boolean;
+  suggested: Partial<{
+    title: string; company: string; location: string; job_type: string; apply_url: string;
+    application_deadline: string; description: string; kind: ListingKind; positions: string[];
+  }>;
+}
+
+/** Upload a poster image or TOR / contract document as the admin or as a signed-in employer. */
+export async function uploadListingFile(file: File, as: "admin" | "employer"): Promise<UploadResult> {
+  const form = new FormData();
+  form.append("file", file);
+  // No Content-Type header: the browser must set the multipart boundary itself.
+  const res = as === "admin"
+    ? await adminFetch("/api/uploads", { method: "POST", body: form })
+    : await employerFetch("/api/uploads", { method: "POST", body: form });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Upload failed");
+  return res.json();
 }
 
 export async function createJob(data: JobInput): Promise<{ message: string; job_id: number }> {

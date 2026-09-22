@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response, HTMLResponse
 from pydantic import BaseModel, EmailStr
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, desc, text, nullslast, select
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -32,8 +32,10 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from airflow_home.database.connection import get_db, init_db, SessionLocal
 from airflow_home.database.models import (
-    Job, ScrapeLog, User, UserJobNotification, CVSubmission, AnalyticsEvent, JobSource, EmployerInvite,
+    Job, ScrapeLog, User, UserJobNotification, CVSubmission, AnalyticsEvent, JobSource, EmployerInvite, Attachment,
 )
+from api import ocr
+from api.listing_extract import detect_content_type, extract_text as extract_attachment_text, parse_listing_text
 from airflow_home.config.settings import settings
 from api.cv.extract import extract_text_from_upload, CvExtractionError
 from api.cv.parser import parse_cv
@@ -73,6 +75,18 @@ app.add_middleware(
 
 # --- Pydantic Schemas ---
 
+class AttachmentResponse(BaseModel):
+    id: int
+    url: str
+    filename: str
+    content_type: str
+    size: int
+    kind: str  # 'image' or 'document'
+
+    class Config:
+        orm_mode = True
+
+
 class JobResponse(BaseModel):
     id: int
     title: str
@@ -98,6 +112,7 @@ class JobResponse(BaseModel):
     tor_url: Optional[str] = None
     duration: Optional[str] = None
     budget: Optional[str] = None
+    attachments: List[AttachmentResponse] = []
 
     class Config:
         orm_mode = True
@@ -138,6 +153,7 @@ class CreateJobRequest(BaseModel):
     tor_url: Optional[str] = None  # contracts: link to the Terms of Reference / tender document
     duration: Optional[str] = None  # contracts: e.g. "3 months"
     budget: Optional[str] = None  # contracts: e.g. "KES 800,000"
+    attachment_ids: List[int] = []  # files uploaded via POST /api/uploads before saving
 
 
 class AdminLoginRequest(BaseModel):
@@ -239,6 +255,30 @@ def _ensure_invite_usable(invite: EmployerInvite) -> None:
         raise HTTPException(status_code=403, detail="This access has expired. Contact Annex Careers for a new code.")
 
 
+def require_uploader(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_admin_auth_scheme),
+    db: Session = Depends(get_db),
+) -> str:
+    """Whoever holds a valid admin or employer token may upload listing files.
+    Returns 'admin' or 'employer:<invite id>', recorded on the attachment so a
+    file can only be linked to a listing by the account that uploaded it."""
+    if creds is None:
+        raise HTTPException(status_code=401, detail="Sign in to upload files")
+    try:
+        payload = jwt.decode(creds.credentials, settings.ADMIN_SESSION_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    if payload.get("sub") == "admin":
+        return "admin"
+    if payload.get("sub") == "employer" and payload.get("inv"):
+        invite = db.query(EmployerInvite).filter(EmployerInvite.id == payload["inv"]).first()
+        if not invite:
+            raise HTTPException(status_code=401, detail="This access no longer exists")
+        _ensure_invite_usable(invite)
+        return f"employer:{invite.id}"
+    raise HTTPException(status_code=403, detail="Not allowed to upload files")
+
+
 def require_employer(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_admin_auth_scheme),
     db: Session = Depends(get_db),
@@ -298,6 +338,28 @@ def scheduled_daily_scrape():
 
     # Job-alert emails are no longer sent here: they go out every morning on
     # their own schedule (see scheduled_job_alerts / JOB_ALERT_HOUR_UTC).
+    try:
+        _purge_orphan_attachments()
+    except Exception as e:
+        logger.error(f"Attachment cleanup failed: {e}")
+
+
+def _purge_orphan_attachments(older_than_hours: int = 24) -> int:
+    """Files uploaded to the form but never saved with a listing."""
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=older_than_hours)
+    db = SessionLocal()
+    try:
+        removed = (
+            db.query(Attachment)
+            .filter(Attachment.job_id == None, Attachment.created_at < cutoff)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        if removed:
+            logger.info(f"Purged {removed} abandoned upload(s)")
+        return removed
+    finally:
+        db.close()
 
 
 # --- Automatic job-alert emails -----------------------------------------------
@@ -410,6 +472,7 @@ def startup():
         f"Scheduler started: daily scrape at 11:00 UTC, job alert emails at "
         f"{settings.JOB_ALERT_HOUR_UTC:02d}:00 UTC, keep-alive every 10min"
     )
+    ocr.warm_up_in_background()
 
 
 def _reclassify_scraped_jobs(db: Session) -> dict:
@@ -571,7 +634,7 @@ def list_jobs(
 
     total = query.count()
     pages = math.ceil(total / per_page) if total > 0 else 1
-    jobs = query.offset((page - 1) * per_page).limit(per_page).all()
+    jobs = query.options(selectinload(Job.attachments)).offset((page - 1) * per_page).limit(per_page).all()
 
     return PaginatedResponse(
         jobs=[JobResponse.from_orm(j) for j in jobs],
@@ -579,9 +642,15 @@ def list_jobs(
     )
 
 
+def _public_api_base(request: Request) -> str:
+    """Absolute base for links to this API's own files."""
+    configured = (settings.API_PUBLIC_URL or "").strip().rstrip("/")
+    return configured or str(request.base_url).rstrip("/")
+
+
 @app.get("/api/jobs/{job_id}", response_model=JobResponse)
 def get_job(job_id: int, db: Session = Depends(get_db)):
-    job = db.query(Job).filter(Job.id == job_id).first()
+    job = db.query(Job).options(selectinload(Job.attachments)).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return JobResponse.from_orm(job)
@@ -698,16 +767,38 @@ def _job_from_request(
     )
 
 
+def _attach_uploads(db: Session, job: Job, attachment_ids: List[int], uploader: str, api_base: str) -> int:
+    """Link files the same account uploaded (and hasn't used yet) to a saved
+    listing. A contract without a TOR link gets the first document as its TOR.
+    Caller commits."""
+    if not attachment_ids:
+        return 0
+    rows = (
+        db.query(Attachment)
+        .filter(Attachment.id.in_(attachment_ids), Attachment.job_id == None, Attachment.uploaded_by == uploader)
+        .order_by(Attachment.id).all()
+    )
+    for att in rows:
+        att.job_id = job.id
+    if job.kind == "contract" and not job.tor_url:
+        document = next((a for a in rows if a.kind == "document"), None)
+        if document:
+            job.tor_url = f"{api_base}{document.url}"
+    return len(rows)
+
+
 @app.post("/api/jobs")
-def create_job(req: CreateJobRequest, db: Session = Depends(get_db), _admin=Depends(require_admin)):
+def create_job(req: CreateJobRequest, request: Request, db: Session = Depends(get_db), _admin=Depends(require_admin)):
     if not req.title or not req.title.strip():
         raise HTTPException(status_code=400, detail="Job title is required")
     job = _job_from_request(req, source="manual")
     db.add(job)
     db.commit()
     db.refresh(job)
-    logger.info(f"Manual job created: {job.id} - {job.title}")
-    return {"message": "Job created", "job_id": job.id}
+    attached = _attach_uploads(db, job, req.attachment_ids, "admin", _public_api_base(request))
+    db.commit()
+    logger.info(f"Manual {job.kind} created: {job.id} - {job.title} ({attached} attachment(s))")
+    return {"message": "Job created", "job_id": job.id, "attachments": attached}
 
 
 # --- Admin job management ---
@@ -752,7 +843,7 @@ def admin_list_jobs(
     total = query.count()
     pages = math.ceil(total / per_page) if total > 0 else 1
     jobs = (
-        query.order_by(nullslast(desc(Job.scraped_at)), desc(Job.id))
+        query.options(selectinload(Job.attachments)).order_by(nullslast(desc(Job.scraped_at)), desc(Job.id))
         .offset((page - 1) * per_page).limit(per_page).all()
     )
     return PaginatedResponse(
@@ -765,6 +856,7 @@ def _delete_job_row(db: Session, job: Job) -> None:
     """Remove a job and detach its dependants explicitly rather than trusting
     every deployment's FK ON DELETE clauses to match models.py. Caller commits."""
     job_id = job.id
+    db.query(Attachment).filter(Attachment.job_id == job_id).delete(synchronize_session=False)
     db.query(UserJobNotification).filter(UserJobNotification.job_id == job_id).delete(synchronize_session=False)
     db.query(CVSubmission).filter(CVSubmission.job_id == job_id).update({"job_id": None}, synchronize_session=False)
     db.query(AnalyticsEvent).filter(AnalyticsEvent.job_id == job_id).update({"job_id": None}, synchronize_session=False)
@@ -2166,7 +2258,7 @@ def employer_login(req: EmployerLoginRequest, db: Session = Depends(get_db)):
 @app.get("/api/employer/me")
 def employer_me(invite: EmployerInvite = Depends(require_employer), db: Session = Depends(get_db)):
     jobs = (
-        db.query(Job).filter(Job.employer_invite_id == invite.id)
+        db.query(Job).options(selectinload(Job.attachments)).filter(Job.employer_invite_id == invite.id)
         .order_by(desc(Job.scraped_at), desc(Job.id)).all()
     )
     # Engagement per job: page_view = someone opened the job page,
@@ -2197,7 +2289,10 @@ def employer_me(invite: EmployerInvite = Depends(require_employer), db: Session 
 
 
 @app.post("/api/employer/jobs", status_code=201)
-def employer_create_job(req: CreateJobRequest, invite: EmployerInvite = Depends(require_employer), db: Session = Depends(get_db)):
+def employer_create_job(
+    req: CreateJobRequest, request: Request,
+    invite: EmployerInvite = Depends(require_employer), db: Session = Depends(get_db),
+):
     if not req.title or not req.title.strip():
         raise HTTPException(status_code=400, detail="Job title is required")
     # Company is always the invited company: the form can't post on behalf of someone else.
@@ -2205,7 +2300,10 @@ def employer_create_job(req: CreateJobRequest, invite: EmployerInvite = Depends(
     db.add(job)
     db.commit()
     db.refresh(job)
-    logger.info(f"Employer job posted by {invite.company_name}: {job.id} - {job.title}")
+    _attach_uploads(db, job, req.attachment_ids, f"employer:{invite.id}", _public_api_base(request))
+    db.commit()
+    db.refresh(job)
+    logger.info(f"Employer {job.kind} posted by {invite.company_name}: {job.id} - {job.title}")
     return {"message": "Job published", "job": JobResponse.from_orm(job)}
 
 
@@ -2317,7 +2415,8 @@ def _job_posting_jsonld(job: Job, job_url: str) -> dict:
 
 
 def _render_share_page(title: str, description: str, page_url: str, image_url: str,
-                       jsonld: Optional[dict] = None, og_type: str = "website") -> str:
+                       jsonld: Optional[dict] = None, og_type: str = "website",
+                       image_dims: Optional[tuple] = (1200, 630)) -> str:
     e = html_lib.escape
     page_title = f"{title} | Annex Careers" if title != "Annex Careers" else "Annex Careers - Find Jobs in Kenya"
     # Escape "<" inside the JSON so no tag-like text (let alone "</script>")
@@ -2343,10 +2442,8 @@ def _render_share_page(title: str, description: str, page_url: str, image_url: s
 <meta property="og:url" content="{e(page_url)}">
 <meta property="og:image" content="{e(image_url)}">
 <meta property="og:image:secure_url" content="{e(image_url)}">
-<meta property="og:image:type" content="image/jpeg">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="Annex Careers - Jobs in Kenya">
+{f'<meta property="og:image:width" content="{image_dims[0]}"><meta property="og:image:height" content="{image_dims[1]}">' if image_dims else ""}
+<meta property="og:image:alt" content="{e(title)}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:site" content="@gregorytechKE">
 <meta name="twitter:title" content="{e(title)}">
@@ -2365,19 +2462,26 @@ def _render_share_page(title: str, description: str, page_url: str, image_url: s
 
 
 @app.get("/share/jobs/{job_id}", response_class=HTMLResponse)
-def share_job_page(job_id: int, db: Session = Depends(get_db)):
+def share_job_page(job_id: int, request: Request, db: Session = Depends(get_db)):
     site = SITE_URL.rstrip("/")
     image_url = f"{site}{OG_IMAGE_PATH}"
-    job = db.query(Job).filter(Job.id == job_id).first()
+    image_dims = (1200, 630)
+    job = db.query(Job).options(selectinload(Job.attachments)).filter(Job.id == job_id).first()
     if not job:
         html = _render_share_page("Annex Careers", SITE_TAGLINE, f"{site}/jobs", image_url)
         return HTMLResponse(html, status_code=404, headers={"Cache-Control": "public, max-age=300"})
+
+    # A listing with its own poster shares that poster instead of the site card.
+    poster = next((a for a in job.attachments if a.kind == "image"), None)
+    if poster:
+        image_url = f"{_public_api_base(request)}{poster.url}"
+        image_dims = None
 
     job_url = f"{site}/jobs/{job.id}"
     title = f"{job.title} at {job.company}" if job.company else job.title
     html = _render_share_page(
         title, _share_summary(job), job_url, image_url,
-        jsonld=_job_posting_jsonld(job, job_url), og_type="article",
+        jsonld=_job_posting_jsonld(job, job_url), og_type="article", image_dims=image_dims,
     )
     return HTMLResponse(html, headers={"Cache-Control": "public, max-age=600"})
 
@@ -2408,3 +2512,65 @@ def admin_alerts_run_now(_admin=Depends(require_admin)):
             raise HTTPException(status_code=409, detail="Job alerts are already being sent")
     threading.Thread(target=scheduled_job_alerts, name="job-alerts", daemon=True).start()
     return {"message": "Job alert emails started", "started": True}
+
+
+# --- Listing attachments (poster images, TOR / contract documents) -----------
+# Files are uploaded first (so the form can be pre-filled from their text),
+# then linked to the listing when it is saved. Stored in the database and
+# served from /api/files/{id}.
+
+MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+MAX_EXTRACTED_TEXT = 50_000
+
+
+@app.post("/api/uploads", status_code=201)
+async def upload_listing_file(
+    file: UploadFile = File(...),
+    uploader: str = Depends(require_uploader),
+    db: Session = Depends(get_db),
+):
+    filename = re.sub(r"[\r\n\"\\]", "", (file.filename or "upload").strip())[:300] or "upload"
+    content_type = detect_content_type(filename, file.content_type)
+    if not content_type:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Upload a JPG, PNG, WEBP, PDF, Word (.docx) or text file.")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="The file is empty")
+    if len(content) > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=413, detail=f"File is too large (max {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB)")
+
+    text, kind = extract_attachment_text(filename, content_type, content)
+    attachment = Attachment(
+        filename=filename, content_type=content_type, size=len(content), kind=kind,
+        uploaded_by=uploader, extracted_text=(text or "")[:MAX_EXTRACTED_TEXT] or None, data=content,
+    )
+    db.add(attachment)
+    db.commit()
+    db.refresh(attachment)
+    suggested = parse_listing_text(text) if text else {}
+    logger.info(f"Upload {attachment.id} ({kind}, {len(content)} bytes) by {uploader}; text read: {bool(text)}")
+    return {
+        "id": attachment.id, "url": attachment.url, "filename": filename, "content_type": content_type,
+        "size": len(content), "kind": kind,
+        "read": bool(text), "ocr_available": ocr.ocr_available(),
+        "extracted_text": (text or "")[:20_000],
+        "suggested": suggested,
+    }
+
+
+@app.get("/api/files/{attachment_id}")
+def get_listing_file(attachment_id: int, download: bool = False, db: Session = Depends(get_db)):
+    attachment = db.query(Attachment).filter(Attachment.id == attachment_id).first()
+    if not attachment:
+        raise HTTPException(status_code=404, detail="File not found")
+    safe_name = attachment.filename.encode("ascii", "ignore").decode() or "file"
+    disposition = "attachment" if download else "inline"
+    return Response(
+        content=attachment.data,
+        media_type=attachment.content_type,
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{safe_name}"',
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

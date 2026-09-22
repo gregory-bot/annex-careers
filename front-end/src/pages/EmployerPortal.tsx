@@ -7,7 +7,7 @@ import Layout from "@/components/Layout";
 import JobForm from "@/components/JobForm";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import {
-  employerLogin, getEmployerToken, clearEmployerToken, useEmployerMe,
+  employerLogin, getEmployerToken, clearEmployerToken, useEmployerMe, uploadListingFile,
   createEmployerJob, closeEmployerJob, repostEmployerJob, deleteEmployerJob, EmployerSessionError,
   type JobInput, type EmployerJob,
 } from "@/lib/jobStore";
@@ -170,7 +170,7 @@ const EmployerPortal = () => {
               </div>
 
               <h2 className="font-heading font-semibold text-lg mb-3 flex items-center gap-2"><Briefcase size={18} className="text-primary" /> Post a job or a contract</h2>
-              <JobForm lockedCompany={me.company_name} allowKindSwitch submittingLabel="Publishing..." onSubmit={handlePost} />
+              <JobForm lockedCompany={me.company_name} allowKindSwitch submittingLabel="Publishing..." onSubmit={handlePost} uploader={(file) => uploadListingFile(file, "employer")} />
 
               <div className="mt-10 mb-3 flex flex-col sm:flex-row sm:items-end justify-between gap-2">
                 <div>
