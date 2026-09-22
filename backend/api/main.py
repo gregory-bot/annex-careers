@@ -2491,10 +2491,11 @@ def _render_share_page(title: str, description: str, page_url: str, image_url: s
     page_title = f"{title} | Annex Careers" if title != "Annex Careers" else "Annex Careers - Find Jobs in Kenya"
     # Escape "<" inside the JSON so no tag-like text (let alone "</script>")
     # can appear in the script block; JSON parsers read \u003c as "<".
-    jsonld_tag = (
-        f'<script type="application/ld+json">{json.dumps(jsonld, ensure_ascii=False).replace("<", "\\u003c")}</script>'
-        if jsonld else ""
-    )
+    jsonld_tag = ""
+    if jsonld:
+        # Python 3.11 forbids backslashes inside f-string expressions, so build the value first.
+        safe_json = json.dumps(jsonld, ensure_ascii=False).replace("<", "\\u003c")
+        jsonld_tag = f'<script type="application/ld+json">{safe_json}</script>'
     return f"""<!doctype html>
 <html lang="en">
 <head>
