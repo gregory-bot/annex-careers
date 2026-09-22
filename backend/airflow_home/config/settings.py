@@ -57,6 +57,9 @@ class Settings:
     # Public base URL of this API, used when the API must write absolute links to its own
     # files (share-preview images, auto-filled TOR links). Falls back to the request's host.
     API_PUBLIC_URL     = os.getenv("API_PUBLIC_URL", "")
+    # Only ONE running API instance should scrape and send alert emails. Set to "false" on
+    # every extra instance (e.g. the old server while the new one is live) to avoid duplicates.
+    SCHEDULER_ENABLED  = os.getenv("SCHEDULER_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 
     # ── Admin auth ───────────────────────────────────────────────────────────
     ADMIN_USERNAME       = os.getenv("ADMIN_USERNAME", "")

@@ -1,0 +1,11 @@
+# Keep local-only files out of the image and the build context.
+.venv*
+venv/
+__pycache__/
+*.pyc
+*.log
+.env
+.env.*
+.pytest_cache/
+.git/
+airflow_home/logs/

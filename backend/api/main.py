@@ -471,6 +471,11 @@ def startup():
             logger.warning(f"DB migration note: {e}")
     _backfill_job_kinds()
 
+    if not settings.SCHEDULER_ENABLED:
+        logger.warning("SCHEDULER_ENABLED=false: this instance will not scrape or send alert emails")
+        ocr.warm_up_in_background()
+        return
+
     scheduler.add_job(
         scheduled_daily_scrape,
         CronTrigger(hour=11, minute=0),  # 11 UTC = 2PM EAT
