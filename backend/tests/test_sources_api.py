@@ -41,7 +41,7 @@ class SourcesApiTests(unittest.TestCase):
 
         listing = client.get("/api/admin/sources").json()
         self.assertEqual([s["slug"] for s in listing["custom"]], ["naukri_gulf"])
-        self.assertIn("kemri", [s["slug"] for s in listing["builtin"]])
+        self.assertIn("openedcareer", [s["slug"] for s in listing["builtin"]])
         self.assertEqual(listing["running_sources"], [])
 
         updated = client.put(f"/api/admin/sources/{body['id']}", json={**VALID, "name": "NaukriGulf Kenya", "enabled": False,
@@ -62,15 +62,15 @@ class SourcesApiTests(unittest.TestCase):
         self.db.add_all([
             ScrapeLog(source="naukri_gulf", status="failed", jobs_found=0, started_at=dt.datetime(2026, 9, 20, 8)),
             ScrapeLog(source="naukri_gulf", status="success", jobs_found=12, jobs_new=4, started_at=dt.datetime(2026, 9, 21, 8)),
-            ScrapeLog(source="kemri", status="success", jobs_found=2, started_at=dt.datetime(2026, 9, 22, 8)),
+            ScrapeLog(source="openedcareer", status="success", jobs_found=2, started_at=dt.datetime(2026, 9, 22, 8)),
         ])
         self.db.commit()
         listing = client.get("/api/admin/sources").json()
         custom = listing["custom"][0]["last_run"]
         self.assertEqual((custom["status"], custom["jobs_found"], custom["jobs_new"]), ("success", 12, 4))
         self.assertEqual(custom["started_at"], "2026-09-21T08:00:00+00:00")
-        kemri = next(s for s in listing["builtin"] if s["slug"] == "kemri")
-        self.assertEqual(kemri["last_run"]["jobs_found"], 2)
+        oc = next(s for s in listing["builtin"] if s["slug"] == "openedcareer")
+        self.assertEqual(oc["last_run"]["jobs_found"], 2)
 
     def test_validation_and_conflicts(self):
         self.assertEqual(client.post("/api/admin/sources", json={**VALID, "urls": []}).status_code, 400)
@@ -78,7 +78,7 @@ class SourcesApiTests(unittest.TestCase):
         self.assertEqual(client.post("/api/admin/sources", json={**VALID, "link_pattern": "(unclosed"}).status_code, 400)
         self.assertEqual(client.post("/api/admin/sources", json={**VALID, "max_jobs": 0}).status_code, 400)
         self.assertEqual(client.post("/api/admin/sources", json={**VALID, "name": "   "}).status_code, 400)
-        self.assertEqual(client.post("/api/admin/sources", json={**VALID, "name": "KEMRI"}).status_code, 409)  # built-in
+        self.assertEqual(client.post("/api/admin/sources", json={**VALID, "name": "OpenedCareer"}).status_code, 409)  # built-in
         self.assertEqual(client.post("/api/admin/sources", json=VALID).status_code, 201)
         self.assertEqual(client.post("/api/admin/sources", json=VALID).status_code, 409)  # duplicate slug
         self.assertEqual(client.put("/api/admin/sources/999", json=VALID).status_code, 404)
@@ -90,7 +90,7 @@ class SourcesApiTests(unittest.TestCase):
         self.assertEqual([c["slug"] for c in runner.load_custom_sources()], ["naukri_gulf"])
         self.assertEqual(len(runner.load_custom_sources(enabled_only=False)), 2)
         self.assertTrue(runner.is_known_source("naukri_gulf"))
-        self.assertTrue(runner.is_known_source("kemri"))
+        self.assertTrue(runner.is_known_source("openedcareer"))
         self.assertFalse(runner.is_known_source("nope"))
         scraper = runner.build_scraper("naukri_gulf")
         self.assertIsInstance(scraper, GenericSiteScraper)
@@ -121,11 +121,11 @@ class SourcesApiTests(unittest.TestCase):
             self.assertEqual(calls, ["naukri_gulf"])
 
             with main._scrape_lock:
-                main._running_single_sources.add("kemri")
-            self.assertEqual(client.post("/api/admin/scrape/kemri").status_code, 409)
+                main._running_single_sources.add("openedcareer")
+            self.assertEqual(client.post("/api/admin/scrape/openedcareer").status_code, 409)
             logs = client.get("/api/scrape-logs").json()
             self.assertTrue(logs["in_progress"])
-            self.assertEqual(logs["running_sources"], ["kemri"])
+            self.assertEqual(logs["running_sources"], ["openedcareer"])
         finally:
             main._run_single_scrape_in_background = original
             with main._scrape_lock:
@@ -133,7 +133,7 @@ class SourcesApiTests(unittest.TestCase):
 
     def test_scrape_logs_paginate_and_filter(self):
         for i in range(25):
-            self.db.add(ScrapeLog(source="kemri" if i % 5 else "talent", status="success", jobs_found=i,
+            self.db.add(ScrapeLog(source="openedcareer" if i % 5 else "talent", status="success", jobs_found=i,
                                   started_at=dt.datetime(2026, 9, 1) + dt.timedelta(hours=i)))
         self.db.commit()
 

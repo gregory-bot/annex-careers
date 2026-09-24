@@ -74,7 +74,7 @@ class AdminEndpointTests(unittest.TestCase):
     def test_search_matches_any_field_and_requires_every_term(self):
         make_job(self.db, "Customer Marketing Lead", company="Safaricom PLC")
         make_job(self.db, "Brand Manager", company="PZ Cussons", tags="marketing, fmcg")
-        make_job(self.db, "Accountant", company="Scope Markets", location="Kisumu, Kenya", source="kemri")
+        make_job(self.db, "Accountant", company="Scope Markets", location="Kisumu, Kenya", source="openedcareer")
         target = make_job(self.db, "Fraud Analyst", company="Sportserve")
 
         def titles(**params):
@@ -83,7 +83,7 @@ class AdminEndpointTests(unittest.TestCase):
         self.assertEqual(titles(search="marketing"), ["Brand Manager", "Customer Marketing Lead"])
         self.assertEqual(titles(search="SAFARICOM marketing"), ["Customer Marketing Lead"])
         self.assertEqual(titles(search="kisumu"), ["Accountant"])
-        self.assertEqual(titles(search="kemri"), ["Accountant"])
+        self.assertEqual(titles(search="openedcareer"), ["Accountant"])
         self.assertEqual(titles(search=str(target.id)), ["Fraud Analyst"])
         self.assertEqual(titles(search="jky"), [])
         self.assertEqual(client.get("/api/admin/jobs", params={"search": "jky"}).json()["total"], 0)
@@ -157,7 +157,7 @@ class AdminEndpointTests(unittest.TestCase):
 
     def test_scrape_logs_are_utc_tagged_and_report_progress_flag(self):
         self.db.add(ScrapeLog(
-            source="kemri", status="success", jobs_found=3, jobs_new=1, jobs_updated=2,
+            source="openedcareer", status="success", jobs_found=3, jobs_new=1, jobs_updated=2,
             started_at=dt.datetime(2026, 9, 18, 8, 4, 20), finished_at=dt.datetime(2026, 9, 18, 8, 4, 50),
         ))
         self.db.commit()
