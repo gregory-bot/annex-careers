@@ -10,6 +10,9 @@ import Companies from "./pages/Companies";
 import Locations from "./pages/Locations";
 import Categories from "./pages/Categories";
 import About from "./pages/About";
+import Contact from "./pages/Contact";
+import Privacy from "./pages/Privacy";
+import Terms from "./pages/Terms";
 import Chat from "./pages/Chat";
 import AdminLogin from "./pages/AdminLogin";
 import AdminDashboard from "./pages/AdminDashboard";
@@ -36,6 +39,9 @@ const App = () => (
           <Route path="/categories" element={<Categories />} />
           <Route path="/chat" element={<Chat />} />
           <Route path="/about" element={<About />} />
+          <Route path="/contact" element={<Contact />} />
+          <Route path="/privacy" element={<Privacy />} />
+          <Route path="/terms" element={<Terms />} />
           <Route path="/employer" element={<EmployerPortal />} />
           <Route path="/admin" element={<AdminLogin />} />
           <Route path="/admin/dashboard" element={<AdminDashboard />} />

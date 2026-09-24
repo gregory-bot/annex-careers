@@ -2608,6 +2608,47 @@ def share_job_page(job_id: int, request: Request, db: Session = Depends(get_db))
     return HTMLResponse(html, headers={"Cache-Control": "public, max-age=600"})
 
 
+# --- Sitemap -------------------------------------------------------------------
+# The front-end's robots.txt points crawlers here, so every live listing is
+# discoverable without rebuilding the static site.
+
+SITEMAP_STATIC_PATHS = [
+    ("/", "daily", "1.0"), ("/jobs", "hourly", "0.9"), ("/contracts", "daily", "0.8"),
+    ("/companies", "daily", "0.6"), ("/locations", "daily", "0.6"), ("/categories", "daily", "0.6"),
+    ("/about", "monthly", "0.4"), ("/contact", "monthly", "0.4"),
+    ("/privacy", "yearly", "0.2"), ("/terms", "yearly", "0.2"),
+]
+SITEMAP_MAX_JOBS = 45_000  # the protocol caps a sitemap at 50,000 URLs
+
+
+@app.get("/sitemap.xml")
+def sitemap(db: Session = Depends(get_db)):
+    site = SITE_URL.rstrip("/")
+    entries = [
+        f"<url><loc>{site}{path}</loc><changefreq>{freq}</changefreq><priority>{prio}</priority></url>"
+        for path, freq, prio in SITEMAP_STATIC_PATHS
+    ]
+    jobs = (
+        _active_visible_jobs_query(db)
+        .with_entities(Job.id, Job.posted_date, Job.scraped_at)
+        .order_by(desc(Job.scraped_at))
+        .limit(SITEMAP_MAX_JOBS)
+        .all()
+    )
+    for job_id, posted, scraped in jobs:
+        stamp = scraped or posted
+        lastmod = f"<lastmod>{stamp.date().isoformat()}</lastmod>" if stamp else ""
+        entries.append(f"<url><loc>{site}/jobs/{job_id}</loc>{lastmod}<changefreq>weekly</changefreq><priority>0.7</priority></url>")
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        + "\n".join(entries)
+        + "\n</urlset>\n"
+    )
+    return Response(xml, media_type="application/xml", headers={"Cache-Control": "public, max-age=3600"})
+
+
 # --- Admin: automatic job-alert emails ---------------------------------------
 
 @app.get("/api/admin/alerts/status")

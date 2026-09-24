@@ -84,9 +84,10 @@ const Footer = () => {
             <h5 className="font-semibold text-sm mb-3">Company</h5>
             <div className="flex flex-col gap-2 text-sm text-surface-dark-foreground/60">
               <Link to="/about" className="hover:text-primary transition-colors">About</Link>
-              <a href="#" className="hover:text-primary transition-colors">Privacy</a>
-              <a href="#" className="hover:text-primary transition-colors">Terms</a>
-              <a href="#" className="hover:text-primary transition-colors">Contact</a>
+              <Link to="/contact" className="hover:text-primary transition-colors">Contact</Link>
+              <Link to="/privacy" className="hover:text-primary transition-colors">Privacy Policy</Link>
+              <Link to="/terms" className="hover:text-primary transition-colors">Terms of Use</Link>
+              <a href="mailto:info@annex-technologies.com" className="hover:text-primary transition-colors break-all">info@annex-technologies.com</a>
             </div>
           </div>
           <div>
@@ -109,6 +110,11 @@ const Footer = () => {
               <a href="https://gregory.co.ke/" target="_blank" rel="noopener noreferrer" className="text-white font-bold hover:underline">Gregory</a>{" "}
               and{" "}
               <a href="https://github.com/mainamuragev" target="_blank" rel="noopener noreferrer" className="text-white font-bold hover:underline">Maina</a>.
+            </p>
+            <p className="text-xs text-surface-dark-foreground/50 mt-2">
+              © {new Date().getFullYear()} Annex Technologies ·{" "}
+              <Link to="/privacy" className="hover:text-primary transition-colors">Privacy Policy</Link> ·{" "}
+              <Link to="/terms" className="hover:text-primary transition-colors">Terms of Use</Link>
             </p>
           </div>
         </div>
