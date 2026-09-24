@@ -11,7 +11,8 @@ couldn't structure.
 Known limitations (by design, not oversight):
   - English/Latin-script CVs only — section-header regexes are English.
   - Heavily graphic/Canva-style CVs with little running text parse poorly.
-  - Unconventional section headers get absorbed into the previous section.
+  - Unrecognised section headers are kept verbatim under their own heading
+    (`extra_sections`) rather than being structured.
   - Title vs. company ordering on an experience line is a best guess.
 """
 import re
@@ -43,15 +44,31 @@ DEGREE_KEYWORDS = (
 )
 
 SECTION_PATTERNS: dict[str, re.Pattern] = {
-    "summary": re.compile(r"^(professional\s+)?(summary|profile|objective)s?\s*:?$", re.IGNORECASE),
-    "experience": re.compile(
-        r"^(work\s+)?(experience|employment(\s+history)?|career\s+history|professional\s+experience)s?\s*:?$",
+    "summary": re.compile(
+        r"^((professional|career|personal|executive)\s+)?(summary|profile|objective|statement)s?\s*:?$|^about\s+me\s*:?$",
         re.IGNORECASE,
     ),
-    "education": re.compile(r"^(education|academic\s+qualifications?)\s*:?$", re.IGNORECASE),
-    "skills": re.compile(r"^(skills|technical\s+skills|core\s+competenc(y|ies)|key\s+skills)\s*:?$", re.IGNORECASE),
-    "certifications": re.compile(r"^certifications?\s*:?$", re.IGNORECASE),
-    "projects": re.compile(r"^projects?\s*:?$", re.IGNORECASE),
+    # "Relevant Experience" is also the heading our own generated CV uses, so
+    # re-uploading a generated CV must still find the jobs.
+    "experience": re.compile(
+        r"^((work|relevant|professional|employment|career|industry|related)\s+)?"
+        r"(experience|employment(\s+history)?|history|work\s+history)s?\s*:?$",
+        re.IGNORECASE,
+    ),
+    "education": re.compile(
+        r"^(education(al)?(\s+(background|history|&\s+training|and\s+training))?|academic\s+(qualifications?|background|history)|qualifications)\s*:?$",
+        re.IGNORECASE,
+    ),
+    "skills": re.compile(
+        r"^((technical|core|key|professional|relevant|hard|soft)\s+)?(skills|competenc(y|ies))(\s*(&|and)\s*(tools|technologies|expertise|competencies))?\s*:?$"
+        r"|^(tools|technologies)(\s*(&|and)\s*(tools|technologies))?\s*:?$",
+        re.IGNORECASE,
+    ),
+    "certifications": re.compile(
+        r"^((licen[cs]es|awards)\s*(&|and)\s*)?(certifications?|certificates?)(\s*(&|and)\s*(licen[cs]es|training|courses))?\s*:?$",
+        re.IGNORECASE,
+    ),
+    "projects": re.compile(r"^((key|selected|personal|academic)\s+)?projects?\s*:?$", re.IGNORECASE),
 }
 
 
@@ -79,6 +96,11 @@ class ParsedCV:
     experience: list[ExperienceEntry] = field(default_factory=list)
     education: list[EducationEntry] = field(default_factory=list)
     summary: str | None = None
+    certifications: list[str] = field(default_factory=list)
+    projects: list[str] = field(default_factory=list)
+    # Sections with headings we don't structure (Languages, Awards, Referees...),
+    # kept verbatim as (heading, lines) so nothing the candidate wrote is lost.
+    extra_sections: list[tuple[str, list[str]]] = field(default_factory=list)
     raw_text: str = ""
     parse_confidence: float = 0.0
     low_confidence: bool = True
@@ -142,11 +164,23 @@ def _mine_skills(text: str) -> list[str]:
 
 def _split_skills_section(block_lines: list[str]) -> list[str]:
     joined = " ".join(block_lines)
-    parts = re.split(r"[,\n|;]|(?<=\w)\s{2,}(?=\w)", joined)
+    # "Python (pandas, NumPy)" is one skill: hide separators inside brackets
+    # from the split below, then restore them.
+    depth, chars = 0, []
+    for i, ch in enumerate(joined):
+        depth = max(0, depth + (ch in "([") - (ch in ")]"))
+        spaced_dash = ch in "-–" and joined[i - 1:i] == " " and joined[i + 1:i + 2] == " "
+        chars.append("\0" if depth > 0 and (ch in ",;|•·" or spaced_dash) else ch)
+    joined = "".join(chars)
+    # Separators: commas, pipes, semicolons, bullets/middots (a PDF's "•"
+    # often extracts as " - "), and runs of spaces.
+    parts = re.split(r"[,\n|;•·]|\s[-–]\s|(?<=\w)\s{2,}(?=\w)", joined)
     skills = []
     for part in parts:
-        cleaned = part.strip("-• \t")
-        if 2 <= len(cleaned) <= 40:
+        cleaned = part.strip("-• \t").replace(" \0 ", ", ").replace("\0", ",").strip()
+        if cleaned.count("(") != cleaned.count(")"):
+            cleaned = cleaned.replace("(", "").replace(")", "").strip()
+        if 2 <= len(cleaned) <= 60:
             skills.append(cleaned)
     return skills
 
@@ -165,17 +199,37 @@ def _is_entry_header(line: str) -> bool:
     )
 
 
+def _split_title_company(text: str) -> tuple[str, str]:
+    parts = re.split(r",|\||\s+-\s+|–|—| at ", text, maxsplit=1)
+    title = parts[0].strip(" ,|–—·")
+    company = parts[1].strip(" ,|–—·") if len(parts) > 1 else ""
+    return title, company
+
+
+def _is_title_line(line: str) -> bool:
+    """A 'Data Engineer — Acme' line sitting directly above its own
+    'Nairobi · Jan 2022 – Present' line: capitalised, short, not a bullet and
+    not the tail of a sentence."""
+    return bool(
+        line
+        and not line.startswith(("-", "•"))
+        and re.match(r"[A-Z]", line)
+        and not re.search(r"[.,;:]$", line)
+        and len(line.split()) <= 12
+        and not _is_entry_header(line)
+    )
+
+
 def _parse_experience_block(block_lines: list[str]) -> list[ExperienceEntry]:
     entries: list[ExperienceEntry] = []
     current: ExperienceEntry | None = None
     pending_bullet = False
+    previous_plain: str | None = None  # last non-bullet line, if it may be a title
     for line in block_lines:
         stripped = line.strip()
         if not stripped:
             continue
         if _is_entry_header(stripped):
-            if current:
-                entries.append(current)
             date_match = (
                 DATE_RANGE_RE.search(stripped)
                 or YEAR_RANGE_RE.search(stripped)
@@ -183,12 +237,32 @@ def _parse_experience_block(block_lines: list[str]) -> list[ExperienceEntry]:
                 or PRESENT_RE.search(stripped)
             )
             dates = date_match.group(0) if date_match else ""
-            header_text = stripped.replace(dates, "").strip(" -,|–—")
-            parts = re.split(r",|\||\s+-\s+|–| at ", header_text, maxsplit=1)
-            title = parts[0].strip()
-            company = parts[1].strip() if len(parts) > 1 else ""
+            header_text = stripped.replace(dates, "").strip(" -,|–—·")
+            title_line = None
+            # Only a short remainder (a location like "Nairobi" or
+            # "Acme, Nairobi (Contract)") means the title is on the line above.
+            if previous_plain and len(header_text.split()) <= 5:
+                title_line = previous_plain
+                # That title line was provisionally stored as a bullet (or as a
+                # bulletless entry); take it back.
+                if current and current.bullets and current.bullets[-1] == previous_plain:
+                    current.bullets.pop()
+                elif current and not current.bullets and current.title == previous_plain:
+                    current = None
+            if current:
+                entries.append(current)
+            if title_line:
+                title, company = _split_title_company(title_line)
+                location = header_text.strip(" ,|–—·")
+                company = " · ".join(b for b in [company, location] if b)
+            else:
+                title, company = _split_title_company(header_text)
             current = ExperienceEntry(title=title or header_text, company=company, dates=dates)
-        elif stripped.startswith("-"):
+            previous_plain = None
+            pending_bullet = False
+            continue
+        previous_plain = stripped if _is_title_line(stripped) else None
+        if stripped.startswith("-"):
             pending_bullet = not stripped.lstrip("- ").strip()
             bullet = stripped.lstrip("- ").strip()
             if current and bullet:
@@ -243,20 +317,57 @@ def _parse_education_block(block_lines: list[str]) -> list[EducationEntry]:
     return entries
 
 
+def _block_items(block_lines: list[str]) -> list[str]:
+    """Certifications/projects as items: each bullet or unwrapped line starts
+    an item; a lowercase continuation line joins the one before it."""
+    items: list[str] = []
+    for line in block_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        is_bullet = stripped.startswith(("-", "•", "*"))
+        text = stripped.lstrip("-•* ").strip()
+        if not text:
+            continue
+        if items and not is_bullet and re.match(r"[a-z(]", text):
+            items[-1] = f"{items[-1]} {text}"
+        else:
+            items.append(text)
+    return items
+
+
 def parse_cv(raw_text: str) -> ParsedCV:
+    # Our own generated CVs end with this footer; re-uploading one must not
+    # turn it into a "skill".
+    raw_text = re.sub(r"\s*Generated by Annex Careers\s*", "\n", raw_text)
     lines = raw_text.split("\n")
     name, email, phone = _extract_contact(lines)
 
     sections: dict[str, list[str]] = {}
+    extra_sections: list[tuple[str, list[str]]] = []
     current_section = "header"
     sections[current_section] = []
     for line in lines:
-        header = _looks_like_header(line)
+        # The name line is often ALL CAPS, which the header fallback would
+        # otherwise read as the start of an unknown section.
+        header = None if (name and line.strip() == name) else _looks_like_header(line)
+        if header == "other":
+            extra_sections.append((line.strip().rstrip(":").strip(), []))
+            current_section = f"other:{len(extra_sections) - 1}"
+            continue
         if header:
             current_section = header
             sections.setdefault(current_section, [])
             continue
+        if current_section.startswith("other:"):
+            extra_sections[int(current_section.split(":")[1])][1].append(line)
+            continue
         sections.setdefault(current_section, []).append(line)
+    extra_sections = [
+        (heading, [l.strip() for l in body if l.strip()])
+        for heading, body in extra_sections
+        if any(l.strip() for l in body)
+    ]
 
     skills = []
     if "skills" in sections:
@@ -269,6 +380,8 @@ def parse_cv(raw_text: str) -> ParsedCV:
 
     experience = _parse_experience_block(sections.get("experience", []))
     education = _parse_education_block(sections.get("education", []))
+    certifications = _block_items(sections.get("certifications", []))
+    projects = _block_items(sections.get("projects", []))
 
     summary = None
     if "summary" in sections and any(l.strip() for l in sections["summary"]):
@@ -294,7 +407,8 @@ def parse_cv(raw_text: str) -> ParsedCV:
     return ParsedCV(
         name=name, email=email, phone=phone,
         skills=skills, experience=experience, education=education,
-        summary=summary, raw_text=raw_text,
+        summary=summary, certifications=certifications, projects=projects,
+        extra_sections=extra_sections, raw_text=raw_text,
         parse_confidence=round(confidence * 100),
         low_confidence=confidence < 0.4,
     )

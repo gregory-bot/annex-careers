@@ -125,4 +125,7 @@ PROPER_NOUN_STOPWORDS = {
     "july", "august", "september", "october", "november", "december",
     "ltd", "inc", "llc", "plc", "corp", "company", "job", "jobs", "role",
     "team", "work", "annex", "careers",
+    # ALL-CAPS emphasis words in job ads ("NOT required", "MUST have")
+    "not", "must", "all", "any", "new", "now", "can", "may", "etc", "tech",
+    "stack", "apply", "note", "only", "full", "time", "senior", "junior",
 }

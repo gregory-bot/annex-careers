@@ -42,14 +42,16 @@ def extract_job_keywords(job_text: str) -> set[str]:
     keywords = {skill for skill in ALL_SKILLS if re.search(r"\b" + re.escape(skill) + r"\b", lower)}
 
     for match in PROPER_NOUN_RE.finditer(job_text):
-        token = match.group(0)
-        if token.lower() in PROPER_NOUN_STOPWORDS or len(token) < 3:
-            continue
-        # Only keep tokens that look like a tool/product name (has a digit,
-        # an internal capital, or is short and all-caps like "SQL"/"AWS")
-        # to avoid pulling in ordinary capitalized sentence-starters.
-        if token.isupper() or re.search(r"[A-Z].*[A-Z]", token) or any(c.isdigit() for c in token):
-            keywords.add(token.lower())
+        # "AWS/GCP/Microsoft" is three tools, not one keyword a CV could ever
+        # contain verbatim; judge each part on its own.
+        for token in match.group(0).strip("./-").split("/"):
+            if token.lower() in PROPER_NOUN_STOPWORDS or len(token) < 3 or "." in token:
+                continue  # "." also drops abbreviations like "U.S"
+            # Only keep tokens that look like a tool/product name (has a digit,
+            # an internal capital, or is short and all-caps like "SQL"/"AWS")
+            # to avoid pulling in ordinary capitalized sentence-starters.
+            if token.isupper() or re.search(r"[A-Z].*[A-Z]", token) or any(c.isdigit() for c in token):
+                keywords.add(token.lower())
 
     return keywords
 

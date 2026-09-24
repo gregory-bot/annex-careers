@@ -1590,8 +1590,47 @@ def _prepare_cv_analysis(content: bytes, filename: str, job_id: Optional[int], d
         user.cv_text = raw_text
         db.commit()
         user_id = user.id
+        _send_cv_upload_email(db, user, parsed, job)
 
     return parsed, job, result, user_id
+
+
+CV_EMAIL_COOLDOWN = timedelta(hours=1)
+
+
+def _send_cv_upload_email(db: Session, user: User, parsed, job) -> None:
+    """Email job matches to someone who just uploaded a CV, the same way
+    /api/subscribe sends a welcome email. One CV session makes several
+    uploads (check fit, then generate), so skip it if this user already had a
+    CV submission within the cooldown."""
+    if not _email_provider_configured():
+        return
+    recent = db.query(CVSubmission.id).filter(
+        CVSubmission.user_id == user.id,
+        CVSubmission.created_at >= datetime.now(timezone.utc).replace(tzinfo=None) - CV_EMAIL_COOLDOWN,
+    ).first()
+    if recent:
+        return
+
+    interests = ", ".join(parsed.skills[:15]) if parsed.skills else (job.title if job else "")
+    matched = _match_jobs_for_interests(db, interests) if interests else []
+    if not matched:
+        matched = db.query(Job).filter(Job.is_active == True).order_by(desc(Job.scraped_at)).limit(5).all()
+
+    name = (parsed.name or "").title() or "there"
+    interest_label = (
+        (parsed.experience[0].title if parsed.experience and parsed.experience[0].title else None)
+        or (job.title if job else None)
+        or ", ".join(s.title() for s in parsed.skills[:3])
+        or "your skills"
+    )
+    send_email_background(
+        user.email,
+        f"Hey {name} — jobs matched to your CV · Annex Careers",
+        build_targeted_email_html(name, interest_label, matched),
+    )
+    user.last_emailed_at = datetime.now(timezone.utc)
+    db.commit()
 
 
 def _record_cv_submission(db: Session, user_id: Optional[int], job_id: Optional[int], action: str, result, parsed):
