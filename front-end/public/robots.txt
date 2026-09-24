@@ -13,4 +13,5 @@ Allow: /
 User-agent: *
 Allow: /
 
+Sitemap: https://careers.annex-technologies.com/sitemap.xml
 Sitemap: https://annex-careers.onrender.com/sitemap.xml
